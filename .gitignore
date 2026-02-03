@@ -1,1 +1,5 @@
+# Cargo artefacts
 /target
+
+# Nix artefacts
+/result
