@@ -1,0 +1,12 @@
+[package]
+name = "cardano-scrawls"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Cardano standard canonical ledger state (SCLS) library"
+readme = "README.md"
+repository = "https://github.com/tweag/cardano-scrawls"
+keywords = ["cardano", "scls"]
+categories = ["cryptography::cryptocurrencies", "parsing"]
+
+[dependencies]
