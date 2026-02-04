@@ -1,0 +1,34 @@
+name: CI
+
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+
+
+jobs:
+
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-unstable
+
+      # TODO Needs a Cachix cache and token
+      # - name: Set up Nix cache
+      #   uses: cachix/cachix-action@v16
+      #   with:
+      #     name: XXX
+      #     authToken: "${{ secrets.XXX }}"
+
+      - name: Lint, format check and test
+        run: nix -L flake check
