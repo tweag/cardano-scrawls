@@ -23,12 +23,11 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixpkgs-unstable
 
-      # TODO Needs a Cachix cache and token
-      # - name: Set up Nix cache
-      #   uses: cachix/cachix-action@v16
-      #   with:
-      #     name: XXX
-      #     authToken: "${{ secrets.XXX }}"
+      - name: Set up Nix cache
+        uses: cachix/cachix-action@v16
+        with:
+          name: tweag-cardano-cls
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: Lint, format check and test
         run: nix -L flake check

@@ -44,7 +44,7 @@
         };
 
         # Build *just* the cargo dependencies, so we can reuse
-        # all of that work (e.g. via cachix) when running in CI
+        # all of that work (e.g. via Cachix) when running in CI
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         # Build the actual crate itself, reusing the dependency artefacts
@@ -105,4 +105,11 @@
         };
       }
     );
+
+  nixConfig = {
+    extra-substituters = [ "https://tweag-cardano-cls.cachix.org" ];
+    extra-trusted-public-keys = [
+      "tweag-cardano-cls.cachix.org-1:4/Ger2Oe/TpXbV4RY45mvuFt6t4RFMiJXi1y4/YugIU="
+    ];
+  };
 }
