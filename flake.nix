@@ -100,7 +100,7 @@
           # Additional dev tools
           packages = [
             pkgs.rust-analyzer
-            cardano-cls.legacyPackages.${system}.cardanoCanonicalLedger.hsPkgs.scls-util.components.exes.scls-util
+            cardano-cls.packages.${system}."scls-util:exe:scls-util"
           ];
 
           # Environment variables
