@@ -13,7 +13,7 @@ pub enum ChunkFormat {
     /// All entries compressed as ZSTD
     Zstd = 0x01,
 
-    // Each entry value compressed independently
+    /// Each entry value compressed independently
     ZstdPerEntry = 0x02,
 }
 

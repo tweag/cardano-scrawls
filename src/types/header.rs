@@ -28,6 +28,6 @@ impl Header {
 
     /// Checks if this version is supported for reading.
     pub fn is_supported(&self) -> bool {
-        self.version == 1 // For now
+        self.version == Self::CURRENT_VERSION // For now
     }
 }

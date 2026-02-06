@@ -31,7 +31,7 @@ pub enum RecordType {
     /// Index data (reserved for future use)
     Index = 0x21,
 
-    /// Directory footer (reserved for future user)
+    /// Directory footer (reserved for future use)
     Directory = 0x30,
 
     /// Metadata entries
@@ -64,9 +64,6 @@ impl TryFrom<u8> for RecordType {
     type Error = SclsError;
 
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
-        Self::from_byte(byte).ok_or(SclsError::MalformedRecord(format!(
-            "invalid record type: 0x{:02x}",
-            byte
-        )))
+        Self::from_byte(byte).ok_or(SclsError::UnknownRecordType(byte))
     }
 }
