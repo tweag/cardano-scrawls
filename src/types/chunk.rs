@@ -1,7 +1,7 @@
 //! SCLS chunk records and entries.
 
 use crate::error::SclsError;
-use crate::types::digest::Digest;
+use crate::types::Digest;
 
 /// Compression format for chunk data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +68,7 @@ pub struct Chunk {
 }
 
 /// A single key-value entry within a chunk
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Fixed-size key (length determined by chunk's key_len)
     pub key: Vec<u8>,
@@ -78,7 +79,7 @@ pub struct Entry {
 
 /// Footer at the end of each chunk containing integrity information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkFotter {
+pub struct ChunkFooter {
     /// Number of entries in the chunk
     pub entries_count: u64,
 

@@ -16,9 +16,6 @@ impl Header {
     /// Current supported version that this library writes
     pub const CURRENT_VERSION: u32 = 1;
 
-    /// Record type identifier for header records
-    pub const RECORD_TYPE: u8 = 0x00;
-
     /// Creates a new header with the specified version.
     pub const fn new(version: u32) -> Self {
         Self { version }

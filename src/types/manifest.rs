@@ -1,6 +1,6 @@
 //! SCLS manifest record.
 
-use crate::types::digest::Digest;
+use crate::types::Digest;
 
 /// The manifest record (record type 0x01) containing file metadata and integrity information.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,11 +25,6 @@ pub struct Manifest {
 
     /// Summary metadata about file creation
     pub summary: Summary,
-}
-
-impl Manifest {
-    /// Record type identifier for manifest records
-    pub const RECORD_TYPE: u8 = 0x01;
 }
 
 /// Information about a single namespace within the file
