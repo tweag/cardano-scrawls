@@ -9,6 +9,7 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    cardano-cls.url = "github:tweag/cardano-cls";
   };
 
   outputs =
@@ -18,6 +19,7 @@
       crane,
       flake-utils,
       rust-overlay,
+      cardano-cls,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -98,6 +100,7 @@
           # Additional dev tools
           packages = [
             pkgs.rust-analyzer
+            cardano-cls.packages.${system}."scls-util:exe:scls-util"
           ];
 
           # Environment variables
@@ -107,7 +110,9 @@
     );
 
   nixConfig = {
-    extra-substituters = [ "https://tweag-cardano-cls.cachix.org" ];
+    extra-substituters = [
+      "https://tweag-cardano-cls.cachix.org"
+    ];
     extra-trusted-public-keys = [
       "tweag-cardano-cls.cachix.org-1:4/Ger2Oe/TpXbV4RY45mvuFt6t4RFMiJXi1y4/YugIU="
     ];
