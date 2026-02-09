@@ -52,6 +52,6 @@ pub struct Summary {
     /// Name of the tool that generated the file
     pub tool: String,
 
-    /// Optional comment
-    pub comment: String,
+    /// Comment
+    pub comment: Option<String>,
 }
