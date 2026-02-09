@@ -1,4 +1,5 @@
 pub mod error;
+pub mod reader;
 pub mod types;
 
 pub fn add(left: u64, right: u64) -> u64 {
