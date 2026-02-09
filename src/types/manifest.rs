@@ -25,6 +25,10 @@ pub struct Manifest {
 
     /// Summary metadata about file creation
     pub summary: Summary,
+
+    /// Relative offset to the beginning of this record
+    /// (can be used to find the manifest by reading the last 4 bytes of the file)
+    pub offset: u32,
 }
 
 /// Information about a single namespace within the file
