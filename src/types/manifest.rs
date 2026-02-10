@@ -35,7 +35,7 @@ pub struct Manifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceInfo {
     /// Number of entries in this namespace
-    pub entries_count: u8,
+    pub entries_count: u64,
 
     /// Number of chunks for this namespace
     pub chunks_count: u64,
