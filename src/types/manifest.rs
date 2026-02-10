@@ -1,5 +1,6 @@
 //! SCLS manifest record.
 
+use crate::error::{Result, SclsError};
 use crate::types::Digest;
 
 /// The manifest record (record type 0x01) containing file metadata and integrity information.
@@ -58,4 +59,18 @@ pub struct Summary {
 
     /// Comment
     pub comment: Option<String>,
+}
+
+impl TryFrom<&[u8]> for Manifest {
+    type Error = SclsError;
+
+    /// Parses a manifest record from its payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - ...
+    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
+        todo!()
+    }
 }

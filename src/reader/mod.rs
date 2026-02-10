@@ -84,20 +84,11 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
 /// Parses a record from its type byte and payload data
 fn parse_record(record_type: u8, data: Vec<u8>) -> Result<Record> {
     match RecordType::from_byte(record_type) {
-        Some(RecordType::Header) => {
-            let header = parse_header(&data)?;
-            Ok(Record::Header(header))
-        }
+        Some(RecordType::Header) => Ok(Record::Header(data.as_slice().try_into()?)),
 
-        Some(RecordType::Chunk) => {
-            let chunk = parse_chunk(&data)?;
-            Ok(Record::Chunk(chunk))
-        }
+        Some(RecordType::Chunk) => Ok(Record::Chunk(data.as_slice().try_into()?)),
 
-        Some(RecordType::Manifest) => {
-            let manifest = parse_manifest(&data)?;
-            Ok(Record::Manifest(manifest))
-        }
+        Some(RecordType::Manifest) => Ok(Record::Manifest(data.as_slice().try_into()?)),
 
         // Future/unimplemented types
         Some(_) => Ok(Record::Unknown { record_type, data }),
@@ -105,129 +96,4 @@ fn parse_record(record_type: u8, data: Vec<u8>) -> Result<Record> {
         // Actually unknown
         None => Ok(Record::Unknown { record_type, data }),
     }
-}
-
-/// Parse a header record from its payload
-fn parse_header(data: &[u8]) -> Result<Header> {
-    // Header size: magic(4) + version(4) = 8 bytes
-    if data.len() != 8 {
-        return Err(SclsError::MalformedRecord(format!(
-            "header must be exactly 8 bytes, found {}",
-            data.len()
-        )));
-    }
-
-    // Check magic bytes
-    let magic = &data[0..4];
-    if magic != Header::MAGIC {
-        return Err(SclsError::InvalidMagic {
-            found: magic.to_vec(),
-        });
-    }
-
-    // Parse version (big-endian u32)
-    // NOTE unwrap is safe because we already checked for length
-    let version_bytes: [u8; 4] = data[4..8].try_into().unwrap();
-    let version = u32::from_be_bytes(version_bytes);
-
-    Ok(Header::new(version))
-}
-
-/// Parses a chunk record from its payload.
-fn parse_chunk(data: &[u8]) -> Result<Chunk> {
-    // Minimum size:
-    // seqno(8) + format(1) + len_ns(4) + len_key(4) + entries_count(4) + digest(28) = 49 bytes
-    if data.len() < 49 {
-        return Err(SclsError::MalformedRecord(format!(
-            "chunk too short: {} bytes",
-            data.len()
-        )));
-    }
-
-    let mut pos = 0;
-
-    // Parse seqno
-    let seqno = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-    pos += 8;
-
-    // Parse format
-    let format = ChunkFormat::from_byte(data[pos]).ok_or_else(|| {
-        SclsError::MalformedRecord(format!("invalid chunk format: 0x{:02x}", data[pos]))
-    })?;
-    pos += 1;
-
-    // Parse namespace
-    let len_ns = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-
-    if pos + len_ns > data.len() {
-        return Err(SclsError::MalformedRecord(
-            "namespace length exceeds data".into(),
-        ));
-    }
-
-    let namespace = str::from_utf8(&data[pos..pos + len_ns])
-        .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace".into()))?
-        .to_string();
-    pos += len_ns;
-
-    // Parse key length
-    let len_key = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
-    pos += 4;
-
-    // Footer is at the end: entries_count(4) + digest(28) = 32 bytes
-    let footer_size = 32;
-    if data.len() < pos + footer_size {
-        return Err(SclsError::MalformedRecord(
-            "chunk too short for footer".into(),
-        ));
-    }
-
-    let footer_start = data.len() - footer_size;
-    let entries_data = &data[pos..footer_size];
-
-    // Parse footer
-    let entries_count =
-        u32::from_be_bytes(data[footer_start..footer_start + 4].try_into().unwrap());
-
-    let digest_bytes: [u8; 28] = data[footer_start + 4..footer_start + 32]
-        .try_into()
-        .unwrap();
-    let digest = digest_bytes.into();
-
-    let footer = ChunkFooter {
-        entries_count,
-        digest,
-    };
-
-    // Parse entries
-    let entries = parse_entries(entries_data, len_key)?;
-
-    // Verify count
-    if entries.len() as u32 != entries_count {
-        return Err(SclsError::MalformedRecord(format!(
-            "entry count mismatch: expected {}, found {}",
-            entries_count,
-            entries.len()
-        )));
-    }
-
-    Ok(Chunk {
-        seqno,
-        format,
-        namespace,
-        key_len: len_key,
-        entries,
-        footer,
-    })
-}
-
-/// Parse entries
-fn parse_entries(data: &[u8], len_key: u32) -> Result<Vec<Entry>> {
-    todo!()
-}
-
-/// Parse manifest
-fn parse_manifest(data: &[u8]) -> Result<Manifest> {
-    todo!()
 }
