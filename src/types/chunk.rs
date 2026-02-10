@@ -81,7 +81,7 @@ pub struct Entry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkFooter {
     /// Number of entries in the chunk
-    pub entries_count: u64,
+    pub entries_count: u32,
 
     /// Blake2b-224 hash of the chunk's entries
     pub digest: Digest,
