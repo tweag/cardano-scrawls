@@ -1,8 +1,6 @@
 //! SCLS file header record.
 
-use std::result::Result;
-
-use crate::error::SclsError;
+use crate::error::{Result, SclsError};
 
 /// The SCLS file header (record type 0x00)
 ///
@@ -46,7 +44,7 @@ impl TryFrom<&[u8]> for Header {
     /// Returns an error if:
     /// - The payload is not exactly 8 bytes
     /// - The magic bytes are not "SCLS"
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+    fn try_from(value: &[u8]) -> Result<Self> {
         // Header size: magic(4) + version(4) = 8 bytes
         if value.len() != 8 {
             return Err(SclsError::MalformedRecord(format!(
@@ -64,7 +62,7 @@ impl TryFrom<&[u8]> for Header {
         }
 
         // Parse version (big-endian u32)
-        // NOTE unwrap is safe because we already checked for length
+        // NOTE Version checking is left to the caller (there's only one version atm)
         let version_bytes: [u8; 4] = value[4..8].try_into().unwrap();
         let version = u32::from_be_bytes(version_bytes);
 

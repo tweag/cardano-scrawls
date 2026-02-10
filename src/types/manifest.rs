@@ -1,5 +1,7 @@
 //! SCLS manifest record.
 
+use std::str;
+
 use crate::error::{Result, SclsError};
 use crate::types::Digest;
 
@@ -71,7 +73,7 @@ impl TryFrom<&[u8]> for Manifest {
     /// Returns an error if:
     /// - The payload is too short for required fields
     /// - UTF-8 decoding fails for strings
-    /// - Namespace info parsing files
+    /// - Namespace info parsing fails
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
         let mut pos = 0;
 
@@ -155,7 +157,7 @@ fn parse_tstr(data: &[u8]) -> Result<(String, usize)> {
         )));
     }
 
-    let s = std::str::from_utf8(&data[4..4 + len])
+    let s = str::from_utf8(&data[4..4 + len])
         .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in tstr".into()))?
         .to_string();
 
@@ -227,7 +229,7 @@ fn parse_namespace_info_list(data: &[u8]) -> Result<(Vec<NamespaceInfo>, usize)>
         let chunks_count = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let name = std::str::from_utf8(&data[pos..pos + len_ns])
+        let name = str::from_utf8(&data[pos..pos + len_ns])
             .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace name".into()))?
             .to_string();
         pos += len_ns;

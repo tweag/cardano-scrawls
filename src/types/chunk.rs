@@ -1,5 +1,7 @@
 //! SCLS chunk records and entries.
 
+use std::str;
+
 use crate::error::{Result, SclsError};
 use crate::types::Digest;
 
@@ -150,7 +152,7 @@ impl TryFrom<&[u8]> for Chunk {
         }
 
         let footer_start = value.len() - footer_size;
-        let entries_data = &value[pos..footer_size];
+        let entries_data = &value[pos..footer_start];
 
         // Parse footer
         let entries_count =
@@ -170,6 +172,7 @@ impl TryFrom<&[u8]> for Chunk {
         let entries = parse_entries(entries_data, key_len)?;
 
         // Verify count
+        // NOTE Count verification happens after parsing entries, so is susceptible to DoS attacks
         if entries.len() as u32 != entries_count {
             return Err(SclsError::MalformedRecord(format!(
                 "entry count mismatch: expected {}, found {}",
@@ -192,6 +195,13 @@ impl TryFrom<&[u8]> for Chunk {
 /// Parse entries from a chunk's data blob.
 ///
 /// Each entry consists of a 4-byte length prefix, a fixed-size key and a variable-size value.
+///
+/// # Note
+///
+/// This function currently allocates on an untrusted length input. It would make sense to put a
+/// configurable upper limit on this to prevent memory saturation.
+///
+/// See [issue #7](https://github.com/tweag/cardano-scrawls/issues/7).
 ///
 /// # Errors
 ///

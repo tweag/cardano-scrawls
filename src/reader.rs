@@ -69,6 +69,8 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         let record_type = type_buf[0];
 
         // Read the remaining payload
+        // NOTE Using `saturating_sub` will silently handle the edge case where `payload_len == 0`;
+        // whereas this is probably indicative of a malformed file rather than an empty record.
         let data_len = payload_len.saturating_sub(1) as usize;
         let mut data = vec![0u8; data_len];
         if let Err(e) = self.reader.reader.read_exact(&mut data) {
