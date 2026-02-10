@@ -83,7 +83,7 @@
               inherit cargoArtifacts;
               partitions = 1;
               partitionType = "count";
-              cargoNextestExtraArgs = "--no-fail-fast --success-output immediate --failure-output immediate";
+              cargoNextestExtraArgs = "--no-tests warn --no-fail-fast --success-output immediate --failure-output immediate";
             }
           );
         };
