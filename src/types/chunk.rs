@@ -128,7 +128,7 @@ impl TryFrom<&[u8]> for Chunk {
 
         if pos + len_ns > value.len() {
             return Err(SclsError::MalformedRecord(
-                "namespace length exceeds data".into(),
+                "namespace length extends beyond data".into(),
             ));
         }
 
@@ -189,7 +189,57 @@ impl TryFrom<&[u8]> for Chunk {
     }
 }
 
-/// Parse entries
+/// Parse entries from a chunk's data blob.
+///
+/// Each entry consists of a 4-byte length prefix, a fixed-size key and a variable-size value.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - An entry's length prefix extends beyond the payload
+/// - An entry's body is shorter than the key length
 fn parse_entries(data: &[u8], key_len: u32) -> Result<Vec<Entry>> {
-    todo!()
+    let mut entries = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        // Need at least 4 bytes for length prefix
+        if pos + 4 > data.len() {
+            return Err(SclsError::MalformedRecord(
+                "incomplete entry length prefix".into(),
+            ));
+        }
+
+        // Parse entry length
+        let len_body = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // Check we have enough data for the body
+        if pos + len_body > data.len() {
+            return Err(SclsError::MalformedRecord(format!(
+                "entry body extends beyond data: need {} bytes, have {} bytes",
+                len_body,
+                data.len() - pos
+            )));
+        }
+
+        let key_len_usize = key_len as usize;
+
+        // Body must be at least as large as the key
+        if len_body < key_len_usize {
+            return Err(SclsError::MalformedRecord(format!(
+                "entry body too short for key: body {} bytes, key {} bytes",
+                len_body, key_len
+            )));
+        }
+
+        // Extract key and value
+        let key = data[pos..pos + key_len_usize].to_vec();
+        let value = data[pos + key_len_usize..pos + len_body].to_vec();
+
+        entries.push(Entry { key, value });
+        pos += len_body;
+    }
+
+    Ok(entries)
 }
