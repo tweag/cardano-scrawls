@@ -10,3 +10,4 @@ keywords = ["cardano", "scls"]
 categories = ["cryptography::cryptocurrencies", "parsing"]
 
 [dependencies]
+thiserror = "2.0.18"
