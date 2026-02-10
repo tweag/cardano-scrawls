@@ -1,10 +1,9 @@
 //! SCLS file reader and record parsing.
 
 use std::io::{Read, Seek};
-use std::str;
 
-use crate::error::{Result, SclsError};
-use crate::types::{Chunk, ChunkFooter, ChunkFormat, Entry, Header, Manifest, RecordType};
+use crate::error::Result;
+use crate::types::{Chunk, Header, Manifest, RecordType};
 
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {

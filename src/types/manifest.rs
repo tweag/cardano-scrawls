@@ -155,7 +155,7 @@ fn parse_tstr(data: &[u8]) -> Result<(String, usize)> {
         )));
     }
 
-    let s = std::str::from_utf(&data[4..4 + len])
+    let s = std::str::from_utf8(&data[4..4 + len])
         .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in tstr".into()))?
         .to_string();
 
