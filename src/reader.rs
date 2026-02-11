@@ -105,3 +105,179 @@ fn parse_record(record_type: u8, data: Vec<u8>) -> Result<Record> {
         None => Ok(Record::Unknown { record_type, data }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::ops::RangeInclusive;
+    use std::str;
+
+    use crate::error::Result;
+    use crate::types::ChunkFormat;
+
+    use super::{Record, SclsReader};
+
+    /// Slurped in fixture generated from Haskell reference implementation:
+    /// ```sh
+    /// scls-util debug generate minimal-raw.scls --namespace blocks/v0:1
+    /// ```
+    const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/minimal-raw.scls");
+
+    /// Fixture ranges extracted from the [Kaitai IDE](https://ide.kaitai.io), using the Kaitai
+    /// specification defined in [CIP-0165](https://github.com/tweag/CIPs/tree/cip-canonical/CIP-0165)
+    const HEADER_VERSION: RangeInclusive<usize> = 0x9..=0xc;
+    const CHUNK_SEQ_NO: RangeInclusive<usize> = 0x12..=0x19;
+    const CHUNK_NAMESPACE: RangeInclusive<usize> = 0x1f..=0x27;
+    const CHUNK_KEY_LEN: RangeInclusive<usize> = 0x28..=0x2b;
+    const CHUNK_ENTRY_KEY: RangeInclusive<usize> = 0x30..=0x53;
+    const CHUNK_ENTRY_VALUE: RangeInclusive<usize> = 0x54..=0x5c;
+    const CHUNK_ENTRY_COUNT: RangeInclusive<usize> = 0x5d..=0x60;
+    const CHUNK_DIGEST: RangeInclusive<usize> = 0x61..=0x7c;
+    const MANIFEST_SLOT_NO: RangeInclusive<usize> = 0x82..=0x89;
+    const MANIFEST_TOTAL_ENTRIES: RangeInclusive<usize> = 0x8a..=0x91;
+    const MANIFEST_TOTAL_CHUNKS: RangeInclusive<usize> = 0x92..=0x99;
+    const MANIFEST_ROOT_HASH: RangeInclusive<usize> = 0x11c..=0x137;
+    const MANIFEST_NSINFO_ENTRIES_COUNT: RangeInclusive<usize> = 0xdb..=0xe2;
+    const MANIFEST_NSINFO_CHUNKS_COUNT: RangeInclusive<usize> = 0xe3..=0xea;
+    const MANIFEST_NSINFO_NAME: RangeInclusive<usize> = 0xeb..=0xf3;
+    const MANIFEST_NSINFO_DIGEST: RangeInclusive<usize> = 0xf4..=0x10f;
+    const MANIFEST_PREV_MANIFEST: RangeInclusive<usize> = 0x114..=0x11b;
+    const MANIFEST_SUMMARY_CREATED_AT: RangeInclusive<usize> = 0x9e..=0xbb;
+    const MANIFEST_SUMMARY_TOOL: RangeInclusive<usize> = 0xc0..=0xd2;
+    const MANIFEST_OFFSET: RangeInclusive<usize> = 0x138..=0x13b;
+
+    #[test]
+    fn read_fixture_records() -> Result<()> {
+        let scls = Cursor::new(FIXTURE);
+        let mut reader = SclsReader::new(scls);
+
+        for record in reader.records() {
+            match record? {
+                Record::Header(header) => {
+                    assert_eq!(
+                        header.version,
+                        u32::from_be_bytes(FIXTURE[HEADER_VERSION].try_into().unwrap())
+                    )
+                }
+
+                // We only have one chunk, with one entry
+                Record::Chunk(chunk) => {
+                    assert_eq!(
+                        chunk.seqno,
+                        u64::from_be_bytes(FIXTURE[CHUNK_SEQ_NO].try_into().unwrap())
+                    );
+
+                    assert_eq!(chunk.format, ChunkFormat::Raw);
+
+                    assert_eq!(
+                        chunk.namespace,
+                        str::from_utf8(&FIXTURE[CHUNK_NAMESPACE]).unwrap()
+                    );
+
+                    assert_eq!(
+                        chunk.key_len,
+                        u32::from_be_bytes(FIXTURE[CHUNK_KEY_LEN].try_into().unwrap())
+                    );
+
+                    let footer_entry_count =
+                        u32::from_be_bytes(FIXTURE[CHUNK_ENTRY_COUNT].try_into().unwrap());
+
+                    assert_eq!(chunk.entries.len(), footer_entry_count as usize);
+
+                    let entry = chunk.entries.first().unwrap();
+                    assert_eq!(entry.key, FIXTURE[CHUNK_ENTRY_KEY]);
+                    assert_eq!(entry.value, FIXTURE[CHUNK_ENTRY_VALUE]);
+
+                    assert_eq!(chunk.footer.entries_count, footer_entry_count);
+
+                    assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
+                }
+
+                Record::Manifest(manifest) => {
+                    assert_eq!(
+                        manifest.slot_no,
+                        u64::from_be_bytes(FIXTURE[MANIFEST_SLOT_NO].try_into().unwrap())
+                    );
+
+                    assert_eq!(
+                        manifest.total_entries,
+                        u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_ENTRIES].try_into().unwrap())
+                    );
+
+                    assert_eq!(
+                        manifest.total_chunks,
+                        u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_CHUNKS].try_into().unwrap())
+                    );
+
+                    assert_eq!(*manifest.root_hash.as_bytes(), FIXTURE[MANIFEST_ROOT_HASH]);
+
+                    assert_eq!(manifest.namespace_info.len(), 1);
+                    let ns_info = manifest.namespace_info.first().unwrap();
+
+                    assert_eq!(
+                        ns_info.entries_count,
+                        u64::from_be_bytes(
+                            FIXTURE[MANIFEST_NSINFO_ENTRIES_COUNT].try_into().unwrap()
+                        )
+                    );
+
+                    assert_eq!(
+                        ns_info.chunks_count,
+                        u64::from_be_bytes(
+                            FIXTURE[MANIFEST_NSINFO_CHUNKS_COUNT].try_into().unwrap()
+                        )
+                    );
+
+                    assert_eq!(
+                        ns_info.name,
+                        str::from_utf8(&FIXTURE[MANIFEST_NSINFO_NAME]).unwrap()
+                    );
+
+                    assert_eq!(*ns_info.digest.as_bytes(), FIXTURE[MANIFEST_NSINFO_DIGEST]);
+
+                    assert_eq!(
+                        manifest.prev_manifest,
+                        u64::from_be_bytes(FIXTURE[MANIFEST_PREV_MANIFEST].try_into().unwrap())
+                    );
+
+                    assert_eq!(
+                        manifest.summary.created_at,
+                        str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_CREATED_AT]).unwrap()
+                    );
+
+                    assert_eq!(
+                        manifest.summary.tool,
+                        str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_TOOL]).unwrap()
+                    );
+
+                    assert_eq!(manifest.summary.comment, None);
+
+                    assert_eq!(
+                        manifest.offset,
+                        u32::from_be_bytes(FIXTURE[MANIFEST_OFFSET].try_into().unwrap())
+                    );
+                }
+
+                Record::Unknown { record_type, .. } => {
+                    panic!("Unknown record type: 0x{:02x}", record_type)
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_has_expected_structure() -> Result<()> {
+        let scls = Cursor::new(FIXTURE);
+        let mut reader = SclsReader::new(scls);
+        let records: Vec<_> = reader.records().collect::<Result<_>>()?;
+
+        assert_eq!(records.len(), 3);
+        assert!(matches!(records[0], Record::Header(_)));
+        assert!(matches!(records[1], Record::Chunk(_)));
+        assert!(matches!(records[2], Record::Manifest(_)));
+
+        Ok(())
+    }
+}
