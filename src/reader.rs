@@ -2,7 +2,7 @@
 
 use std::io::{Read, Seek};
 
-use crate::error::Result;
+use crate::error::{Result, SclsError};
 use crate::types::{Chunk, Header, Manifest, RecordType};
 
 /// A reader for SCLS files that can iterate over records.
@@ -61,6 +61,13 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
 
         let payload_len = u32::from_be_bytes(len_buf);
 
+        // Check the payload isn't empty
+        if payload_len == 0 {
+            return Some(Err(SclsError::MalformedRecord(
+                "zero length payload record".into(),
+            )));
+        }
+
         // Read the 1-byte record type
         let mut type_buf = [0u8; 1];
         if let Err(e) = self.reader.reader.read_exact(&mut type_buf) {
@@ -69,9 +76,7 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         let record_type = type_buf[0];
 
         // Read the remaining payload
-        // NOTE Using `saturating_sub` will silently handle the edge case where `payload_len == 0`;
-        // whereas this is probably indicative of a malformed file rather than an empty record.
-        let data_len = payload_len.saturating_sub(1) as usize;
+        let data_len = (payload_len - 1) as usize;
         let mut data = vec![0u8; data_len];
         if let Err(e) = self.reader.reader.read_exact(&mut data) {
             return Some(Err(e.into()));
