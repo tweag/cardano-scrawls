@@ -52,6 +52,8 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Read the 4-byte length prefix
+        // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at the
+        // end of the file won't be picked up as a truncated/corrupted file; see issue #9.
         let mut len_buf = [0u8; 4];
         match self.reader.reader.read_exact(&mut len_buf) {
             Ok(()) => {}
