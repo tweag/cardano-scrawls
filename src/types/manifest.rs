@@ -102,7 +102,11 @@ impl TryFrom<&[u8]> for Manifest {
         pos += bytes_read;
 
         // Parse footer fields
-        if value.len() < pos + 40 {
+        let needed_len = pos
+            .checked_add(40)
+            .ok_or_else(|| SclsError::MalformedRecord("footer length overflow".into()))?;
+
+        if value.len() < needed_len {
             return Err(SclsError::MalformedRecord(
                 "manifest too short for footer fields".into(),
             ));
@@ -150,18 +154,22 @@ fn parse_tstr(data: &[u8]) -> Result<(String, usize)> {
 
     let len = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
 
-    if data.len() < 4 + len {
+    let total_len = len
+        .checked_add(4)
+        .ok_or_else(|| SclsError::MalformedRecord("tstr length overflow".into()))?;
+
+    if data.len() < total_len {
         return Err(SclsError::MalformedRecord(format!(
             "tstr length {} bytes extends beyond remaining data",
             len
         )));
     }
 
-    let s = str::from_utf8(&data[4..4 + len])
+    let s = str::from_utf8(&data[4..total_len])
         .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in tstr".into()))?
         .to_string();
 
-    Ok((s, 4 + len))
+    Ok((s, total_len))
 }
 
 /// Parses the summary section (3 `tstr` fields).
@@ -198,10 +206,14 @@ fn parse_summary(data: &[u8]) -> Result<(Summary, usize)> {
 /// Returns the list and number of bytes consumed.
 fn parse_namespace_info_list(data: &[u8]) -> Result<(Vec<NamespaceInfo>, usize)> {
     let mut namespaces = Vec::new();
-    let mut pos = 0;
+    let mut pos: usize = 0;
 
     loop {
-        if data.len() < pos + 4 {
+        let needed_len = pos
+            .checked_add(4)
+            .ok_or_else(|| SclsError::MalformedRecord("namespace_info length overflow".into()))?;
+
+        if data.len() < needed_len {
             return Err(SclsError::MalformedRecord(
                 "incomplete namespace_info length".into(),
             ));
@@ -217,7 +229,11 @@ fn parse_namespace_info_list(data: &[u8]) -> Result<(Vec<NamespaceInfo>, usize)>
 
         // Parse ns_info: entries_count(8) + chunks_count(8) + name(len_ns) + digest(28)
         let required = 8 + 8 + len_ns + 28;
-        if data.len() < pos + required {
+        let min_len = pos
+            .checked_add(required)
+            .ok_or_else(|| SclsError::MalformedRecord("ns_info length overflow".into()))?;
+
+        if data.len() < min_len {
             return Err(SclsError::MalformedRecord(
                 "incomplete namespace_info structure".into(),
             ));

@@ -128,7 +128,11 @@ impl TryFrom<&[u8]> for Chunk {
         let len_ns = u32::from_be_bytes(value[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        if pos + len_ns > value.len() {
+        let total_len = pos
+            .checked_add(len_ns)
+            .ok_or_else(|| SclsError::MalformedRecord("namespace length overflow".into()))?;
+
+        if total_len > value.len() {
             return Err(SclsError::MalformedRecord(
                 "namespace length extends beyond data".into(),
             ));
@@ -145,7 +149,11 @@ impl TryFrom<&[u8]> for Chunk {
 
         // Footer is at the end: entries_count(4) + digest(28) = 32 bytes
         let footer_size = 32;
-        if value.len() < pos + footer_size {
+        let needed_len = pos
+            .checked_add(footer_size)
+            .ok_or_else(|| SclsError::MalformedRecord("footer length overflow".into()))?;
+
+        if value.len() < needed_len {
             return Err(SclsError::MalformedRecord(
                 "chunk too short for footer".into(),
             ));
@@ -214,7 +222,11 @@ fn parse_entries(data: &[u8], key_len: u32) -> Result<Vec<Entry>> {
 
     while pos < data.len() {
         // Need at least 4 bytes for length prefix
-        if pos + 4 > data.len() {
+        let needed_len = pos
+            .checked_add(4)
+            .ok_or_else(|| SclsError::MalformedRecord("entry length overflow".into()))?;
+
+        if needed_len > data.len() {
             return Err(SclsError::MalformedRecord(
                 "incomplete entry length prefix".into(),
             ));
@@ -225,7 +237,11 @@ fn parse_entries(data: &[u8], key_len: u32) -> Result<Vec<Entry>> {
         pos += 4;
 
         // Check we have enough data for the body
-        if pos + len_body > data.len() {
+        let needed_len = pos
+            .checked_add(len_body)
+            .ok_or_else(|| SclsError::MalformedRecord("entry body length overflow".into()))?;
+
+        if needed_len > data.len() {
             return Err(SclsError::MalformedRecord(format!(
                 "entry body extends beyond data: need {} bytes, have {} bytes",
                 len_body,
