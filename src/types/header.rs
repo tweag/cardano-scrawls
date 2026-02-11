@@ -1,5 +1,7 @@
 //! SCLS file header record.
 
+use crate::error::{Result, SclsError};
+
 /// The SCLS file header (record type 0x00)
 ///
 /// Contains magic bytes for file identification and version information.
@@ -29,5 +31,41 @@ impl Header {
     /// Checks if this version is supported for reading.
     pub fn is_supported(&self) -> bool {
         self.version == Self::CURRENT_VERSION // For now
+    }
+}
+
+impl TryFrom<&[u8]> for Header {
+    type Error = SclsError;
+
+    /// Parses a header record from its payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The payload is not exactly 8 bytes
+    /// - The magic bytes are not "SCLS"
+    fn try_from(value: &[u8]) -> Result<Self> {
+        // Header size: magic(4) + version(4) = 8 bytes
+        if value.len() != 8 {
+            return Err(SclsError::MalformedRecord(format!(
+                "header must be exactly 8 bytes, found {}",
+                value.len()
+            )));
+        }
+
+        // Check magic bytes
+        let magic = &value[0..4];
+        if magic != Header::MAGIC {
+            return Err(SclsError::InvalidMagic {
+                found: magic.to_vec(),
+            });
+        }
+
+        // Parse version (big-endian u32)
+        // NOTE Version checking is left to the caller (there's only one version atm)
+        let version_bytes: [u8; 4] = value[4..8].try_into().unwrap();
+        let version = u32::from_be_bytes(version_bytes);
+
+        Ok(Self::new(version))
     }
 }
