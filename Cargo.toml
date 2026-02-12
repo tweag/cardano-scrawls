@@ -11,3 +11,6 @@ categories = ["cryptography::cryptocurrencies", "parsing"]
 
 [dependencies]
 thiserror = "2.0.18"
+
+[dev-dependencies]
+proptest = "1.10.0"
