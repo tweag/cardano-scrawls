@@ -264,3 +264,135 @@ fn parse_namespace_info_list(data: &[u8]) -> Result<(Vec<NamespaceInfo>, usize)>
 
     Ok((namespaces, pos))
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    // Strategy to generate a tstr (length-prefixed UTF-8 string)
+    fn tstr_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop::string::string_regex("[a-zA-Z0-9 ]{0,100}")
+            .unwrap()
+            .prop_map(|s| {
+                let len = s.len() as u32;
+                let mut bytes = len.to_be_bytes().to_vec();
+                bytes.extend_from_slice(s.as_bytes());
+                bytes
+            })
+    }
+
+    // Strategy to generate a summary section
+    fn summary_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (tstr_bytes(), tstr_bytes(), tstr_bytes()).prop_map(|(created, tool, comment)| {
+            let mut bytes = Vec::new();
+            bytes.extend(created);
+            bytes.extend(tool);
+            bytes.extend(comment);
+            bytes
+        })
+    }
+
+    // Strategy to generate a single namespace_info entry
+    fn namespace_info_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (
+            any::<u64>(),                                         // entries_count
+            any::<u64>(),                                         // chunks_count
+            prop::string::string_regex("[a-z/_]{1,20}").unwrap(), // name
+            prop::array::uniform28(any::<u8>()),                  // digest
+        )
+            .prop_map(|(entries, chunks, name, digest)| {
+                let len_ns = name.len() as u32;
+                let mut bytes = len_ns.to_be_bytes().to_vec();
+                bytes.extend(entries.to_be_bytes());
+                bytes.extend(chunks.to_be_bytes());
+                bytes.extend(name.as_bytes());
+                bytes.extend(digest);
+                bytes
+            })
+    }
+
+    // Strategy to generate namespace_info list with sentinel
+    fn namespace_info_list_bytes(num_namespaces: usize) -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(namespace_info_bytes(), num_namespaces..=num_namespaces).prop_map(
+            |namespaces| {
+                let mut bytes = namespaces.concat();
+                bytes.extend(0u32.to_be_bytes()); // Sentinel (len_ns = 0)
+                bytes
+            },
+        )
+    }
+
+    // Strategy to generate a complete manifest
+    fn manifest_bytes(num_namespaces: usize) -> impl Strategy<Value = Vec<u8>> {
+        (
+            any::<u64>(), // slot_no
+            any::<u64>(), // total_entries
+            any::<u64>(), // total_chunks
+            summary_bytes(),
+            namespace_info_list_bytes(num_namespaces),
+            any::<u64>(),                        // prev_manifest
+            prop::array::uniform28(any::<u8>()), // root_hash
+            any::<u32>(),                        // offset
+        )
+            .prop_map(
+                |(slot, entries, chunks, summary, ns_info, prev, root, offset)| {
+                    let mut bytes = Vec::new();
+                    bytes.extend(slot.to_be_bytes());
+                    bytes.extend(entries.to_be_bytes());
+                    bytes.extend(chunks.to_be_bytes());
+                    bytes.extend(summary);
+                    bytes.extend(ns_info);
+                    bytes.extend(prev.to_be_bytes());
+                    bytes.extend(root);
+                    bytes.extend(offset.to_be_bytes());
+                    bytes
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn parse_manifest_consumes_all_bytes(data in (0usize..=5).prop_flat_map(manifest_bytes)) {
+            // The parser should have consumed all the bytes, which we verify in our try_from impl
+            // so there's no need to test here
+            let result = Manifest::try_from(data.as_slice());
+            prop_assert!(result.is_ok());
+        }
+
+        #[test]
+        fn parse_manifest_namespace_count_matches(
+            params in (0usize..=5)
+                .prop_flat_map(|num_ns| {
+                    manifest_bytes(num_ns)
+                        .prop_map(move |data| (num_ns, data))
+                })
+        ) {
+            let (num_ns, data) = params;
+            let manifest = Manifest::try_from(data.as_slice())?;
+            prop_assert_eq!(manifest.namespace_info.len(), num_ns);
+        }
+
+        #[test]
+        fn parse_manifest_rejects_trailing_bytes(
+            data in (0usize..=5).prop_flat_map(manifest_bytes),
+            extra in prop::collection::vec(any::<u8>(), 1..10)
+        ) {
+            let mut malformed = data;
+            malformed.extend(extra);
+
+            let result = Manifest::try_from(malformed.as_slice());
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn parse_manifest_rejects_truncated(data in (0usize..=5).prop_flat_map(manifest_bytes)) {
+            prop_assume!(data.len() > 10);
+
+            let truncated = &data[..data.len() - 5];
+            let result = Manifest::try_from(truncated);
+            prop_assert!(result.is_err());
+        }
+    }
+}
