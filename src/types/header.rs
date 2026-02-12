@@ -69,3 +69,47 @@ impl TryFrom<&[u8]> for Header {
         Ok(Self::new(version))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn rejects_wrong_length(bytes in prop::collection::vec(any::<u8>(),0..100)) {
+            // Skip the valid case
+            prop_assume!(bytes.len() != 8);
+
+            let result = Header::try_from(bytes.as_slice());
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn rejects_wrong_magic(
+            wrong_magic in prop::collection::vec(any::<u8>(), 4..=4),
+            version_bytes in prop::array::uniform4(any::<u8>())
+        ) {
+            // Skip the valid case
+            prop_assume!(wrong_magic.as_slice() != b"SCLS");
+
+            let mut bytes = wrong_magic;
+            bytes.extend_from_slice(&version_bytes);
+
+            let result = Header::try_from(bytes.as_slice());
+            let is_invalid_magic = matches!(result, Err(SclsError::InvalidMagic { .. }));
+            prop_assert!(is_invalid_magic);
+        }
+
+        #[test]
+        fn accepts_any_valid_version(version in any::<u32>()) {
+            let mut bytes = b"SCLS".to_vec();
+            bytes.extend_from_slice(&version.to_be_bytes());
+
+            let result = Header::try_from(bytes.as_slice());
+            prop_assert!(result.is_ok());
+            prop_assert_eq!(result.unwrap().version, version);
+        }
+    }
+}
