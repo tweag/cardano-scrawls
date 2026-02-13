@@ -289,6 +289,8 @@ impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -328,9 +330,19 @@ mod tests {
                 })
         ) {
             let (key_len, num_entries, data) = params;
-            let result = parse_entries(&data, key_len)?;
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
 
-            prop_assert_eq!(result.len(), num_entries);
+            let iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+            };
+
+            let result: Result<Vec<Entry>> = iter.collect();
+            let entries = result?;
+
+            prop_assert_eq!(entries.len(), num_entries);
         }
 
         #[test]
@@ -342,7 +354,17 @@ mod tests {
                 })
         ) {
             let (key_len, data) = params;
-            let entries = parse_entries(&data, key_len)?;
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
+
+            let iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+            };
+
+            let result: Result<Vec<Entry>> = iter.collect();
+            let entries = result?;
 
             for entry in entries {
                 prop_assert_eq!(entry.key.len(), key_len as usize);
@@ -355,8 +377,19 @@ mod tests {
         ) {
             // Only 2 bytes instead of 4 for length prefix
             let data = vec![0x00, 0x01];
-            let result = parse_entries(&data, key_len);
-            prop_assert!(result.is_err());
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
+
+            let mut iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+            };
+
+            // Try to read one entry, should fail
+            let result = iter.next();
+            prop_assert!(result.is_some());
+            prop_assert!(result.unwrap().is_err());
         }
 
         #[test]
@@ -367,8 +400,19 @@ mod tests {
             let mut data = 2u32.to_be_bytes().to_vec();
             data.extend_from_slice(&[0xff, 0xff]);
 
-            let result = parse_entries(&data, key_len);
-            prop_assert!(result.is_err());
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
+
+            let mut iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+            };
+
+            // Try to read one entry, should fail
+            let result = iter.next();
+            prop_assert!(result.is_some());
+            prop_assert!(result.unwrap().is_err());
         }
     }
 }

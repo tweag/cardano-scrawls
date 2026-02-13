@@ -186,136 +186,123 @@ mod tests {
     const MANIFEST_OFFSET: RangeInclusive<usize> = 0x138..=0x13b;
 
     #[test]
-    fn read_fixture_records() -> Result<()> {
+    fn read_minimal_fixture() -> Result<()> {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
 
-        for record in reader.records() {
-            match record? {
-                Record::Header(header) => {
-                    assert_eq!(
-                        header.version,
-                        u32::from_be_bytes(FIXTURE[HEADER_VERSION].try_into().unwrap())
-                    )
-                }
+        let records: Vec<_> = reader.records().collect::<Result<_>>()?;
+        assert_eq!(records.len(), 3);
 
-                // We only have one chunk, with one entry
-                Record::Chunk(chunk) => {
-                    assert_eq!(
-                        chunk.seqno,
-                        u64::from_be_bytes(FIXTURE[CHUNK_SEQ_NO].try_into().unwrap())
-                    );
-
-                    assert_eq!(chunk.format, ChunkFormat::Raw);
-
-                    assert_eq!(
-                        chunk.namespace,
-                        str::from_utf8(&FIXTURE[CHUNK_NAMESPACE]).unwrap()
-                    );
-
-                    assert_eq!(
-                        chunk.key_len,
-                        u32::from_be_bytes(FIXTURE[CHUNK_KEY_LEN].try_into().unwrap())
-                    );
-
-                    let footer_entry_count =
-                        u32::from_be_bytes(FIXTURE[CHUNK_ENTRY_COUNT].try_into().unwrap());
-
-                    assert_eq!(chunk.entries.len(), footer_entry_count as usize);
-
-                    let entry = chunk.entries.first().unwrap();
-                    assert_eq!(entry.key, FIXTURE[CHUNK_ENTRY_KEY]);
-                    assert_eq!(entry.value, FIXTURE[CHUNK_ENTRY_VALUE]);
-
-                    assert_eq!(chunk.footer.entries_count, footer_entry_count);
-
-                    assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
-                }
-
-                Record::Manifest(manifest) => {
-                    assert_eq!(
-                        manifest.slot_no,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_SLOT_NO].try_into().unwrap())
-                    );
-
-                    assert_eq!(
-                        manifest.total_entries,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_ENTRIES].try_into().unwrap())
-                    );
-
-                    assert_eq!(
-                        manifest.total_chunks,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_CHUNKS].try_into().unwrap())
-                    );
-
-                    assert_eq!(*manifest.root_hash.as_bytes(), FIXTURE[MANIFEST_ROOT_HASH]);
-
-                    assert_eq!(manifest.namespace_info.len(), 1);
-                    let ns_info = manifest.namespace_info.first().unwrap();
-
-                    assert_eq!(
-                        ns_info.entries_count,
-                        u64::from_be_bytes(
-                            FIXTURE[MANIFEST_NSINFO_ENTRIES_COUNT].try_into().unwrap()
-                        )
-                    );
-
-                    assert_eq!(
-                        ns_info.chunks_count,
-                        u64::from_be_bytes(
-                            FIXTURE[MANIFEST_NSINFO_CHUNKS_COUNT].try_into().unwrap()
-                        )
-                    );
-
-                    assert_eq!(
-                        ns_info.name,
-                        str::from_utf8(&FIXTURE[MANIFEST_NSINFO_NAME]).unwrap()
-                    );
-
-                    assert_eq!(*ns_info.digest.as_bytes(), FIXTURE[MANIFEST_NSINFO_DIGEST]);
-
-                    assert_eq!(
-                        manifest.prev_manifest,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_PREV_MANIFEST].try_into().unwrap())
-                    );
-
-                    assert_eq!(
-                        manifest.summary.created_at,
-                        str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_CREATED_AT]).unwrap()
-                    );
-
-                    assert_eq!(
-                        manifest.summary.tool,
-                        str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_TOOL]).unwrap()
-                    );
-
-                    assert_eq!(manifest.summary.comment, None);
-
-                    assert_eq!(
-                        manifest.offset,
-                        u32::from_be_bytes(FIXTURE[MANIFEST_OFFSET].try_into().unwrap())
-                    );
-                }
-
-                Record::Unknown { record_type, .. } => {
-                    panic!("Unknown record type: 0x{:02x}", record_type)
-                }
-            }
+        // Test header
+        if let Record::Header(header) = &records[0] {
+            assert_eq!(
+                header.version,
+                u32::from_be_bytes(FIXTURE[HEADER_VERSION].try_into().unwrap())
+            )
+        } else {
+            panic!("Expected header");
         }
 
-        Ok(())
-    }
+        // Test chunk
+        if let Record::Chunk(chunk) = &records[1] {
+            assert_eq!(
+                chunk.seqno,
+                u64::from_be_bytes(FIXTURE[CHUNK_SEQ_NO].try_into().unwrap())
+            );
 
-    #[test]
-    fn fixture_has_expected_structure() -> Result<()> {
-        let scls = Cursor::new(FIXTURE);
-        let mut reader = SclsReader::new(scls);
-        let records: Vec<_> = reader.records().collect::<Result<_>>()?;
+            assert_eq!(chunk.format, ChunkFormat::Raw);
 
-        assert_eq!(records.len(), 3);
-        assert!(matches!(records[0], Record::Header(_)));
-        assert!(matches!(records[1], Record::Chunk(_)));
-        assert!(matches!(records[2], Record::Manifest(_)));
+            assert_eq!(
+                chunk.namespace,
+                str::from_utf8(&FIXTURE[CHUNK_NAMESPACE]).unwrap()
+            );
+
+            assert_eq!(
+                chunk.key_len,
+                u32::from_be_bytes(FIXTURE[CHUNK_KEY_LEN].try_into().unwrap())
+            );
+
+            let footer_entry_count =
+                u32::from_be_bytes(FIXTURE[CHUNK_ENTRY_COUNT].try_into().unwrap());
+
+            assert_eq!(chunk.footer.entries_count, footer_entry_count);
+
+            assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
+
+            let mut cursor = Cursor::new(FIXTURE);
+            let entries: Vec<_> = chunk.entries(&mut cursor)?.collect::<Result<_>>()?;
+            assert_eq!(entries.len(), 1);
+
+            let entry = entries.first().unwrap();
+            assert_eq!(entry.key, FIXTURE[CHUNK_ENTRY_KEY]);
+            assert_eq!(entry.value, FIXTURE[CHUNK_ENTRY_VALUE]);
+        } else {
+            panic!("Expected chunk");
+        }
+
+        // Test manifest
+        if let Record::Manifest(manifest) = &records[2] {
+            assert_eq!(
+                manifest.slot_no,
+                u64::from_be_bytes(FIXTURE[MANIFEST_SLOT_NO].try_into().unwrap())
+            );
+
+            assert_eq!(
+                manifest.total_entries,
+                u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_ENTRIES].try_into().unwrap())
+            );
+
+            assert_eq!(
+                manifest.total_chunks,
+                u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_CHUNKS].try_into().unwrap())
+            );
+
+            assert_eq!(*manifest.root_hash.as_bytes(), FIXTURE[MANIFEST_ROOT_HASH]);
+
+            assert_eq!(manifest.namespace_info.len(), 1);
+            let ns_info = manifest.namespace_info.first().unwrap();
+
+            assert_eq!(
+                ns_info.entries_count,
+                u64::from_be_bytes(FIXTURE[MANIFEST_NSINFO_ENTRIES_COUNT].try_into().unwrap())
+            );
+
+            assert_eq!(
+                ns_info.chunks_count,
+                u64::from_be_bytes(FIXTURE[MANIFEST_NSINFO_CHUNKS_COUNT].try_into().unwrap())
+            );
+
+            assert_eq!(
+                ns_info.name,
+                str::from_utf8(&FIXTURE[MANIFEST_NSINFO_NAME]).unwrap()
+            );
+
+            assert_eq!(*ns_info.digest.as_bytes(), FIXTURE[MANIFEST_NSINFO_DIGEST]);
+
+            assert_eq!(
+                manifest.prev_manifest,
+                u64::from_be_bytes(FIXTURE[MANIFEST_PREV_MANIFEST].try_into().unwrap())
+            );
+
+            assert_eq!(
+                manifest.summary.created_at,
+                str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_CREATED_AT]).unwrap()
+            );
+
+            assert_eq!(
+                manifest.summary.tool,
+                str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_TOOL]).unwrap()
+            );
+
+            assert_eq!(manifest.summary.comment, None);
+
+            assert_eq!(
+                manifest.offset,
+                u32::from_be_bytes(FIXTURE[MANIFEST_OFFSET].try_into().unwrap())
+            );
+        } else {
+            panic!("Expected manifest");
+        }
 
         Ok(())
     }
