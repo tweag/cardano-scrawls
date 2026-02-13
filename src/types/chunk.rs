@@ -47,28 +47,6 @@ impl TryFrom<u8> for ChunkFormat {
     }
 }
 
-/// A chunk of entries with associated metadata and integrity information.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunk {
-    /// Sequential chunk number
-    pub seqno: u64,
-
-    /// Compression format
-    pub format: ChunkFormat,
-
-    /// Namespace these entries belong to
-    pub namespace: String,
-
-    /// Fixed key size for all entries in this chunk
-    pub key_len: u32,
-
-    /// The entries in this chunk
-    pub entries: Vec<Entry>,
-
-    /// Chunk footer with count and digest
-    pub footer: ChunkFooter,
-}
-
 /// A single key-value entry within a chunk
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -89,20 +67,138 @@ pub struct ChunkFooter {
     pub digest: Digest,
 }
 
-impl TryFrom<&[u8]> for Chunk {
+/// A chunk of entries with associated metadata and integrity information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk<'a> {
+    /// Sequential chunk number
+    pub seqno: u64,
+
+    /// Compression format
+    pub format: ChunkFormat,
+
+    /// Namespace these entries belong to
+    pub namespace: String,
+
+    /// Fixed key size for all entries in this chunk
+    pub key_len: u32,
+
+    /// Raw entry data (parsed on-demand via iterator)
+    entries_data: &'a [u8],
+
+    /// Chunk footer with count and digest
+    pub footer: ChunkFooter,
+}
+
+impl<'a> Chunk<'a> {
+    /// Returns an iterator over entries in this chunk
+    pub fn entries(&self) -> EntryIter<'a> {
+        EntryIter {
+            data: self.entries_data,
+            key_len: self.key_len,
+            pos: 0,
+        }
+    }
+}
+
+/// Iterator over entries in a chunk
+pub struct EntryIter<'a> {
+    data: &'a [u8],
+    key_len: u32,
+    pos: usize,
+}
+
+impl<'a> Iterator for EntryIter<'a> {
+    type Item = Result<Entry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+
+        // Parse next entry (i.e., consume one from the current position)
+        Some(self.parse_next_entry())
+    }
+}
+
+impl<'a> EntryIter<'a> {
+    /// Parse the next entry from a chunk's data blob.
+    ///
+    /// Each entry consists of a 4-byte length prefix, a fixed-size key and a variable-size value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Byte offsets overflow
+    /// - An entry's length prefix extends beyond the payload
+    /// - An entry's body is shorter than the key length
+    fn parse_next_entry(&mut self) -> Result<Entry> {
+        // Need at least 4 bytes for length prefix
+        let needed_len = self
+            .pos
+            .checked_add(4)
+            .ok_or_else(|| SclsError::MalformedRecord("entry length overflow".into()))?;
+
+        if needed_len > self.data.len() {
+            return Err(SclsError::MalformedRecord(
+                "incomplete entry length prefix".into(),
+            ));
+        }
+
+        // Parse entry length
+        let len_body =
+            u32::from_be_bytes(self.data[self.pos..self.post + 4].try_into().unwrap()) as usize;
+        self.pos += 4;
+
+        // Check we have enough data for the body
+        let needed_len = pos
+            .checked_add(len_body)
+            .ok_or_else(|| SclsError::MalformedRecord("entry body length overflow".into()))?;
+
+        if needed_len > self.data.len() {
+            return Err(SclsError::MalformedRecord(format!(
+                "entry body extends beyond data: need {} bytes, have {} bytes",
+                len_body,
+                self.data.len() - self.pos
+            )));
+        }
+
+        let key_len_usize = self.key_len as usize;
+
+        // Body must be at least as large as the key
+        if len_body < key_len_usize {
+            return Err(SclsError::MalformedRecord(format!(
+                "entry body too short for key: body {} bytes, key {} bytes",
+                len_body, self.key_len
+            )));
+        }
+
+        // Extract key and value
+        let key = self.data[self.pos..self.pos + key_len_usize].to_vec();
+        let value = self.data[self.pos + key_len_usize..self.pos + len_body].to_vec();
+
+        self.pos += len_body;
+
+        Ok(Entry { key, value })
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for Chunk<'a> {
     type Error = SclsError;
 
     /// Parses a chunk record from its payload.
+    ///
+    /// Entries are not parsed eagerly; use [`Chunk::entries`] to iterate over them.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The payload is too small (fewer than 49 bytes)
+    /// - Byte offsets overflow
     /// - The chunk format is not recognised
     /// - The namespace length overruns the payload
     /// - The namespace is not valid UTF-8
     /// - The footer (32 bytes) overruns the payload
-    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: &'a [u8]) -> std::result::Result<Self, Self::Error> {
         // Minimum size:
         // seqno(8) + format(1) + len_ns(4) + key_len(4) + entries_count(4) + digest(28) = 49 bytes
         if value.len() < 49 {
@@ -176,98 +272,15 @@ impl TryFrom<&[u8]> for Chunk {
             digest,
         };
 
-        // Parse entries
-        let entries = parse_entries(entries_data, key_len)?;
-
-        // Verify count
-        // NOTE Count verification happens after parsing entries, so is susceptible to DoS attacks
-        if entries.len() as u32 != entries_count {
-            return Err(SclsError::MalformedRecord(format!(
-                "entry count mismatch: expected {}, found {}",
-                entries_count,
-                entries.len()
-            )));
-        }
-
         Ok(Chunk {
             seqno,
             format,
             namespace,
             key_len,
-            entries,
+            entries_data,
             footer,
         })
     }
-}
-
-/// Parse entries from a chunk's data blob.
-///
-/// Each entry consists of a 4-byte length prefix, a fixed-size key and a variable-size value.
-///
-/// # Note
-///
-/// This function currently allocates on an untrusted length input. It would make sense to put a
-/// configurable upper limit on this to prevent memory saturation.
-///
-/// See [issue #7](https://github.com/tweag/cardano-scrawls/issues/7).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - An entry's length prefix extends beyond the payload
-/// - An entry's body is shorter than the key length
-fn parse_entries(data: &[u8], key_len: u32) -> Result<Vec<Entry>> {
-    let mut entries = Vec::new();
-    let mut pos = 0;
-
-    while pos < data.len() {
-        // Need at least 4 bytes for length prefix
-        let needed_len = pos
-            .checked_add(4)
-            .ok_or_else(|| SclsError::MalformedRecord("entry length overflow".into()))?;
-
-        if needed_len > data.len() {
-            return Err(SclsError::MalformedRecord(
-                "incomplete entry length prefix".into(),
-            ));
-        }
-
-        // Parse entry length
-        let len_body = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-
-        // Check we have enough data for the body
-        let needed_len = pos
-            .checked_add(len_body)
-            .ok_or_else(|| SclsError::MalformedRecord("entry body length overflow".into()))?;
-
-        if needed_len > data.len() {
-            return Err(SclsError::MalformedRecord(format!(
-                "entry body extends beyond data: need {} bytes, have {} bytes",
-                len_body,
-                data.len() - pos
-            )));
-        }
-
-        let key_len_usize = key_len as usize;
-
-        // Body must be at least as large as the key
-        if len_body < key_len_usize {
-            return Err(SclsError::MalformedRecord(format!(
-                "entry body too short for key: body {} bytes, key {} bytes",
-                len_body, key_len
-            )));
-        }
-
-        // Extract key and value
-        let key = data[pos..pos + key_len_usize].to_vec();
-        let value = data[pos + key_len_usize..pos + len_body].to_vec();
-
-        entries.push(Entry { key, value });
-        pos += len_body;
-    }
-
-    Ok(entries)
 }
 
 #[cfg(test)]
