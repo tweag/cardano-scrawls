@@ -71,7 +71,7 @@ pub struct ChunkFooter {
 
 /// A handle to a chunk in the SCLS file.
 ///
-/// Entry data is loaded lazily when calling ['entries'](ChunkHandle::entries).
+/// Entry data is loaded lazily when calling [`entries`](ChunkHandle::entries).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkHandle {
     /// Sequential chunk number
@@ -249,13 +249,13 @@ impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
             None => {
                 return Some(Err(SclsError::MalformedRecord(
                     "entry body length overflow".into(),
-                )))
+                )));
             }
 
             Some(total_read) if total_read > self.remaining_bytes => {
                 return Some(Err(SclsError::MalformedRecord(
                     "entry extends beyond chunk data".into(),
-                )))
+                )));
             }
 
             Some(total_read) => total_read,
