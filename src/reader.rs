@@ -3,7 +3,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::types::{Chunk, Header, Manifest, RecordType};
+use crate::types::{ChunkHandle, Header, Manifest, RecordType};
 
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {
@@ -22,13 +22,17 @@ impl<R: Read + Seek> SclsReader<R> {
 
     /// Returns an iterator over records in the file.
     pub fn records(&mut self) -> RecordIter<'_, R> {
-        RecordIter { reader: self }
+        RecordIter {
+            reader: self,
+            current_offset: 0,
+        }
     }
 }
 
 /// An iterator over records in an SCLS file.
 pub struct RecordIter<'a, R> {
     reader: &'a mut SclsReader<R>,
+    current_offset: u64,
 }
 
 /// A parsed record from an SCLS file.
@@ -37,8 +41,8 @@ pub enum Record {
     /// File header
     Header(Header),
 
-    /// Data chunk
-    Chunk(Chunk),
+    /// Data chunk (with lazy loading)
+    Chunk(ChunkHandle),
 
     /// Manifest
     Manifest(Manifest),
@@ -51,6 +55,9 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
     type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Track the offset where this record starts
+        let record_start = self.current_offset;
+
         // Read the 4-byte length prefix
         // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at the
         // end of the file won't be picked up as a truncated/corrupted file; see issue #9.
@@ -70,12 +77,24 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             )));
         }
 
+        // Update offset
+        self.current_offset = match self.current_offset.checked_add(4) {
+            Some(offset) => offset,
+            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+        };
+
         // Read the 1-byte record type
         let mut type_buf = [0u8; 1];
         if let Err(e) = self.reader.reader.read_exact(&mut type_buf) {
             return Some(Err(e.into()));
         }
         let record_type = type_buf[0];
+
+        // Update offset
+        self.current_offset = match self.current_offset.checked_add(1) {
+            Some(offset) => offset,
+            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+        };
 
         // Read the remaining payload
         let data_len = (payload_len - 1) as usize;
@@ -84,25 +103,43 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             return Some(Err(e.into()));
         }
 
-        // Parse based on type
-        Some(parse_record(record_type, data))
+        // Update offset
+        self.current_offset = match self.current_offset.checked_add(data_len as u64) {
+            Some(offset) => offset,
+            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+        };
+
+        // Parse based on type, passing the record start offset
+        Some(parse_record(record_type, &data, record_start))
     }
 }
 
 /// Parses a record from its type byte and payload data
-fn parse_record(record_type: u8, data: Vec<u8>) -> Result<Record> {
+fn parse_record(record_type: u8, data: &[u8], record_start_offset: u64) -> Result<Record> {
     match RecordType::from_byte(record_type) {
-        Some(RecordType::Header) => Ok(Record::Header(data.as_slice().try_into()?)),
+        Some(RecordType::Header) => Ok(Record::Header(data.try_into()?)),
 
-        Some(RecordType::Chunk) => Ok(Record::Chunk(data.as_slice().try_into()?)),
+        Some(RecordType::Chunk) => {
+            // Calculate where the chunk data starts in the file
+            // record_start_offset points to the length prefix
+            // After: len(4) + type(1) + header fields, we get to entry data
+            let chunk_handle = ChunkHandle::parse(data, record_start_offset)?;
+            Ok(Record::Chunk(chunk_handle))
+        }
 
-        Some(RecordType::Manifest) => Ok(Record::Manifest(data.as_slice().try_into()?)),
+        Some(RecordType::Manifest) => Ok(Record::Manifest(data.try_into()?)),
 
         // Future/unimplemented types
-        Some(_) => Ok(Record::Unknown { record_type, data }),
+        Some(_) => Ok(Record::Unknown {
+            record_type,
+            data: data.to_vec(),
+        }),
 
         // Actually unknown
-        None => Ok(Record::Unknown { record_type, data }),
+        None => Ok(Record::Unknown {
+            record_type,
+            data: data.to_vec(),
+        }),
     }
 }
 
