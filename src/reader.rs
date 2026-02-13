@@ -51,6 +51,37 @@ pub enum Record {
     Unknown { record_type: u8, data: Vec<u8> },
 }
 
+impl Record {
+    /// Parses a record from its type byte and payload data
+    pub fn parse(record_type: u8, data: &[u8], record_start_offset: u64) -> Result<Self> {
+        match RecordType::from_byte(record_type) {
+            Some(RecordType::Header) => Ok(Self::Header(data.try_into()?)),
+
+            Some(RecordType::Chunk) => {
+                // Calculate where the chunk data starts in the file
+                // record_start_offset points to the length prefix
+                // After: len(4) + type(1) + header fields, we get to entry data
+                let chunk_handle = ChunkHandle::parse(data, record_start_offset)?;
+                Ok(Self::Chunk(chunk_handle))
+            }
+
+            Some(RecordType::Manifest) => Ok(Self::Manifest(data.try_into()?)),
+
+            // Future/unimplemented types
+            Some(_) => Ok(Self::Unknown {
+                record_type,
+                data: data.to_vec(),
+            }),
+
+            // Actually unknown
+            None => Ok(Self::Unknown {
+                record_type,
+                data: data.to_vec(),
+            }),
+        }
+    }
+}
+
 impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
     type Item = Result<Record>;
 
@@ -110,36 +141,7 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         };
 
         // Parse based on type, passing the record start offset
-        Some(parse_record(record_type, &data, record_start))
-    }
-}
-
-/// Parses a record from its type byte and payload data
-fn parse_record(record_type: u8, data: &[u8], record_start_offset: u64) -> Result<Record> {
-    match RecordType::from_byte(record_type) {
-        Some(RecordType::Header) => Ok(Record::Header(data.try_into()?)),
-
-        Some(RecordType::Chunk) => {
-            // Calculate where the chunk data starts in the file
-            // record_start_offset points to the length prefix
-            // After: len(4) + type(1) + header fields, we get to entry data
-            let chunk_handle = ChunkHandle::parse(data, record_start_offset)?;
-            Ok(Record::Chunk(chunk_handle))
-        }
-
-        Some(RecordType::Manifest) => Ok(Record::Manifest(data.try_into()?)),
-
-        // Future/unimplemented types
-        Some(_) => Ok(Record::Unknown {
-            record_type,
-            data: data.to_vec(),
-        }),
-
-        // Actually unknown
-        None => Ok(Record::Unknown {
-            record_type,
-            data: data.to_vec(),
-        }),
+        Some(Record::parse(record_type, &data, record_start))
     }
 }
 
