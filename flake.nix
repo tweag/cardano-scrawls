@@ -41,7 +41,17 @@
 
         # Common arguments for all crane builds
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          src =
+            let
+              # Filter to include test fixtures
+              testFixturesFilter = path: _type: builtins.match ".*/tests/fixtures/.*\\.scls$" path != null;
+              testFixturesOrCargo =
+                path: type: (testFixturesFilter path type) || (craneLib.filterCargoSources path type);
+            in
+            pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter = testFixturesOrCargo;
+            };
           strictDeps = true;
         };
 

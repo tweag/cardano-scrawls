@@ -269,3 +269,89 @@ fn parse_entries(data: &[u8], key_len: u32) -> Result<Vec<Entry>> {
 
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    // Strategy to generate a single serialised entry
+    fn entry_bytes(key_len: u32) -> impl Strategy<Value = Vec<u8>> {
+        let key_len = key_len as usize;
+
+        (
+            prop::collection::vec(any::<u8>(), key_len..=key_len), // Key
+            prop::collection::vec(any::<u8>(), 0..100),            // Value
+        )
+            .prop_map(move |(key, value)| {
+                let body_len = (key.len() + value.len()) as u32;
+                let mut bytes = body_len.to_be_bytes().to_vec();
+
+                bytes.extend_from_slice(&key);
+                bytes.extend_from_slice(&value);
+
+                bytes
+            })
+    }
+
+    // Strategy to generate multiple entries
+    fn entries_data(key_len: u32, num_entries: usize) -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(entry_bytes(key_len), num_entries..=num_entries)
+            .prop_map(|entries| entries.concat())
+    }
+
+    proptest! {
+        #[test]
+        fn parse_entries_count_matches(
+            params in (1u32..=64, 0usize..=10)
+                .prop_flat_map(|(key_len, num_entries)| {
+                    entries_data(key_len, num_entries)
+                        .prop_map(move |data| (key_len, num_entries, data))
+                })
+        ) {
+            let (key_len, num_entries, data) = params;
+            let result = parse_entries(&data, key_len)?;
+
+            prop_assert_eq!(result.len(), num_entries);
+        }
+
+        #[test]
+        fn parse_entries_keys_correct_length(
+            params in (1u32..=64, 1usize..=10)
+                .prop_flat_map(|(key_len, num_entries)| {
+                    entries_data(key_len, num_entries)
+                        .prop_map(move |data| (key_len, data))
+                })
+        ) {
+            let (key_len, data) = params;
+            let entries = parse_entries(&data, key_len)?;
+
+            for entry in entries {
+                prop_assert_eq!(entry.key.len(), key_len as usize);
+            }
+        }
+
+        #[test]
+        fn parse_entries_rejects_truncated_length(
+            key_len in 1u32..=64,
+        ) {
+            // Only 2 bytes instead of 4 for length prefix
+            let data = vec![0x00, 0x01];
+            let result = parse_entries(&data, key_len);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn parse_entries_rejects_body_too_short_for_key(
+            key_len in 4u32..=64,
+        ) {
+            // Claim body is 2 bytes, but key_len is larger
+            let mut data = 2u32.to_be_bytes().to_vec();
+            data.extend_from_slice(&[0xff, 0xff]);
+
+            let result = parse_entries(&data, key_len);
+            prop_assert!(result.is_err());
+        }
+    }
+}
