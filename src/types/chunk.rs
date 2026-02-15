@@ -114,7 +114,20 @@ impl ChunkHandle {
         })
     }
 
-    /// Parses a chunk record, calculating file offsets for lazy entry loading.
+    /// Parses a chunk record directly from a reader, achieving true lazy loading.
+    ///
+    /// This method reads only the chunk header and footer from the reader, calculating the byte
+    /// range where entries are located without ever loading entry data into memory.
+    ///
+    /// After this method returns, the reader position is unspecified (typically at the end of the
+    /// footer). Callers should seek to a known position if they need to continue reading.
+    ///
+    /// # Arguments
+    ///
+    /// - `reader`: A seekable reader positioned at the start of the chunk payload (after the
+    ///   record type byte)
+    /// - `payload_start_offset`: Absolute file offset where the chunk payload begins
+    /// - `payload_len`: Length of the chunk payload in bytes (excluding record type)
     ///
     /// # Errors
     ///
@@ -124,74 +137,89 @@ impl ChunkHandle {
     /// - The chunk format is not recognised
     /// - The namespace length overruns the payload
     /// - The namespace is not valid UTF-8
-    /// - The footer (32 bytes) overruns the payload
-    pub fn parse(data: &[u8], record_start_offset: u64) -> Result<Self> {
-        // Minimum size:
+    /// - I/O errors occur while reading
+    pub fn parse<R: Read + Seek>(
+        reader: &mut R,
+        payload_start_offset: u64,
+        payload_len: u32,
+    ) -> Result<Self> {
+        // Minimum payload size:
         // seqno(8) + format(1) + len_ns(4) + key_len(4) + entries_count(4) + digest(28) = 49 bytes
-        if data.len() < 49 {
+        if payload_len < 49 {
             return Err(SclsError::MalformedRecord(format!(
-                "chunk too short: {} bytes",
-                data.len()
+                "chunk payload too short: {} bytes",
+                payload_len
             )));
         }
 
-        let mut pos = 0;
+        // Read seqno (8 bytes)
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf)?;
+        let seqno = u64::from_be_bytes(buf);
 
-        // Parse seqno
-        let seqno = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        // Parse format
-        let format = ChunkFormat::from_byte(data[pos]).ok_or_else(|| {
-            SclsError::MalformedRecord(format!("invalid chunk format: 0x{:02x}", data[pos]))
+        // Read format (1 byte)
+        let mut format_buf = [0u8; 1];
+        reader.read_exact(&mut format_buf)?;
+        let format = ChunkFormat::from_byte(format_buf[0]).ok_or_else(|| {
+            SclsError::MalformedRecord(format!("invalid chunk format: 0x{:02x}", format_buf[0]))
         })?;
-        pos += 1;
 
-        // Parse namespace
-        let len_ns = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
+        // Read namespace length (4 bytes)
+        let mut len_ns_buf = [0u8; 4];
+        reader.read_exact(&mut len_ns_buf)?;
+        let len_ns = u32::from_be_bytes(len_ns_buf);
 
-        let total_len = pos
+        // Header size so far: seqno(8) + format(1) + len_ns(4) = 13 bytes
+        // Plus namespace and key_len(4) and footer(32)
+        let header_fixed_size: u32 = 8 + 1 + 4 + 4; // 17 bytes without namespace
+        let footer_size: u32 = 32;
+
+        let min_size = header_fixed_size
             .checked_add(len_ns)
+            .and_then(|s| s.checked_add(footer_size))
             .ok_or_else(|| SclsError::MalformedRecord("namespace length overflow".into()))?;
 
-        if total_len > data.len() {
+        if payload_len < min_size {
             return Err(SclsError::MalformedRecord(
-                "namespace length extends beyond data".into(),
+                "chunk payload too short for namespace and footer".into(),
             ));
         }
 
-        let namespace = str::from_utf8(&data[pos..pos + len_ns])
+        // Read namespace
+        let mut ns_buf = vec![0u8; len_ns as usize];
+        reader.read_exact(&mut ns_buf)?;
+        let namespace = str::from_utf8(&ns_buf)
             .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace".into()))?
             .to_string();
-        pos += len_ns;
 
-        // Parse key length
-        let key_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
+        // Read key_len (4 bytes)
+        let mut key_len_buf = [0u8; 4];
+        reader.read_exact(&mut key_len_buf)?;
+        let key_len = u32::from_be_bytes(key_len_buf);
 
-        // Footer is at the end: entries_count(4) + digest(28) = 32 bytes
-        let footer_size = 32;
-        let needed_len = pos
-            .checked_add(footer_size)
-            .ok_or_else(|| SclsError::MalformedRecord("footer length overflow".into()))?;
+        // Calculate header size: seqno(8) + format(1) + len_ns(4) + namespace + key_len(4)
+        let header_size = header_fixed_size + len_ns; // 17 + len_ns
 
-        if data.len() < needed_len {
-            return Err(SclsError::MalformedRecord(
-                "chunk too short for footer".into(),
-            ));
-        }
+        // Calculate entries range
+        // entries start right after header, end 32 bytes before payload end
+        let entries_start = payload_start_offset
+            .checked_add(header_size as u64)
+            .ok_or_else(|| SclsError::MalformedRecord("offset overflow".into()))?;
 
-        let footer_start = data.len() - footer_size;
-        let entries_len = footer_start - pos;
+        let entries_end = payload_start_offset
+            .checked_add(payload_len as u64)
+            .and_then(|end| end.checked_sub(footer_size as u64))
+            .ok_or_else(|| SclsError::MalformedRecord("offset overflow".into()))?;
 
-        // Parse footer
-        let entries_count =
-            u32::from_be_bytes(data[footer_start..footer_start + 4].try_into().unwrap());
+        // Seek to footer and read it
+        let footer_offset = entries_end;
+        reader.seek(SeekFrom::Start(footer_offset))?;
 
-        let digest_bytes: [u8; 28] = data[footer_start + 4..footer_start + 32]
-            .try_into()
-            .unwrap();
+        let mut footer_buf = [0u8; 32];
+        reader.read_exact(&mut footer_buf)?;
+
+        let entries_count = u32::from_be_bytes(footer_buf[0..4].try_into().unwrap());
+        let digest_bytes: [u8; 28] = footer_buf[4..32].try_into().unwrap();
         let digest = digest_bytes.into();
 
         let footer = ChunkFooter {
@@ -199,25 +227,13 @@ impl ChunkHandle {
             digest,
         };
 
-        // Calculate absolute file offset for entry data
-        // record_start_offset + len_prefix(4) + record_type(1) + header_size
-        let entries_offset = record_start_offset
-            .checked_add(4) // len_prefix
-            .and_then(|offset| offset.checked_add(1)) // record_type
-            .and_then(|offset| offset.checked_add(pos as u64)) // chunk header
-            .ok_or_else(|| SclsError::MalformedRecord("offset overflow".into()))?;
-
-        let entries_end = entries_offset
-            .checked_add(entries_len as u64)
-            .ok_or_else(|| SclsError::MalformedRecord("offset overflow".into()))?;
-
         Ok(ChunkHandle {
             seqno,
             format,
             namespace,
             key_len,
             footer,
-            entries_range: entries_offset..entries_end,
+            entries_range: entries_start..entries_end,
         })
     }
 }

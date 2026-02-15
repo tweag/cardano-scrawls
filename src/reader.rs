@@ -52,17 +52,19 @@ pub enum Record {
 }
 
 impl Record {
-    /// Parses a record from its type byte and payload data
-    pub fn parse(record_type: u8, data: &[u8], record_start_offset: u64) -> Result<Self> {
+    /// Parses a non-chunk record from its type byte and payload data.
+    ///
+    /// Note: Chunk records are parsed directly from the reader in `RecordIter::next` to achieve
+    /// lazy loading, so this method will return an error for chunk types.
+    fn parse(record_type: u8, data: &[u8]) -> Result<Self> {
         match RecordType::from_byte(record_type) {
             Some(RecordType::Header) => Ok(Self::Header(data.try_into()?)),
 
             Some(RecordType::Chunk) => {
-                // Calculate where the chunk data starts in the file
-                // record_start_offset points to the length prefix
-                // After: len(4) + type(1) + header fields, we get to entry data
-                let chunk_handle = ChunkHandle::parse(data, record_start_offset)?;
-                Ok(Self::Chunk(chunk_handle))
+                // Chunks should be parsed directly from the reader, not here
+                Err(SclsError::MalformedRecord(
+                    "chunk records must be parsed directly from reader".into(),
+                ))
             }
 
             Some(RecordType::Manifest) => Ok(Self::Manifest(data.try_into()?)),
@@ -86,9 +88,6 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
     type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Track the offset where this record starts
-        let record_start = self.current_offset;
-
         // Read the 4-byte length prefix
         // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at the
         // end of the file won't be picked up as a truncated/corrupted file; see issue #9.
@@ -108,7 +107,7 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             )));
         }
 
-        // Update offset
+        // Update offset past length prefix
         self.current_offset = match self.current_offset.checked_add(4) {
             Some(offset) => offset,
             None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
@@ -121,27 +120,56 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         }
         let record_type = type_buf[0];
 
-        // Update offset
+        // Update offset past type byte
         self.current_offset = match self.current_offset.checked_add(1) {
             Some(offset) => offset,
             None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
         };
 
-        // Read the remaining payload
-        let data_len = (payload_len - 1) as usize;
-        let mut data = vec![0u8; data_len];
+        // The remaining payload length (excluding type byte)
+        let data_len = (payload_len - 1) as u64;
+
+        // Handle chunks specially: parse directly from reader without buffering
+        if RecordType::from_byte(record_type) == Some(RecordType::Chunk) {
+            // Current position is payload start (after type byte)
+            let payload_start = self.current_offset;
+
+            // Parse chunk directly from reader (reads only header + footer)
+            let chunk_result =
+                ChunkHandle::parse(&mut self.reader.reader, payload_start, data_len as u32);
+
+            // Update offset to end of record
+            self.current_offset = match self.current_offset.checked_add(data_len) {
+                Some(offset) => offset,
+                None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+            };
+
+            // Seek to end of record for next iteration
+            if let Err(e) = self
+                .reader
+                .reader
+                .seek(std::io::SeekFrom::Start(self.current_offset))
+            {
+                return Some(Err(e.into()));
+            }
+
+            return Some(chunk_result.map(Record::Chunk));
+        }
+
+        // For non-chunk records, read the full payload into a buffer
+        let mut data = vec![0u8; data_len as usize];
         if let Err(e) = self.reader.reader.read_exact(&mut data) {
             return Some(Err(e.into()));
         }
 
         // Update offset
-        self.current_offset = match self.current_offset.checked_add(data_len as u64) {
+        self.current_offset = match self.current_offset.checked_add(data_len) {
             Some(offset) => offset,
             None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
         };
 
-        // Parse based on type, passing the record start offset
-        Some(Record::parse(record_type, &data, record_start))
+        // Parse based on type
+        Some(Record::parse(record_type, &data))
     }
 }
 
