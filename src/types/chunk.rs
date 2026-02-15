@@ -99,6 +99,10 @@ impl ChunkHandle {
     /// Each entry is read from disk as the iterator advances.
     /// This requires mutable access to the reader.
     ///
+    /// This method seeks the reader to the start of the entry data. The iterator will advance the
+    /// reader position as entries are consumed. The reader position after iteration is unspecified
+    /// and depends on where iteration stopped.
+    ///
     /// # Errors
     ///
     /// Returns an error if seeking to the entry data fails.
@@ -111,6 +115,7 @@ impl ChunkHandle {
             reader,
             key_len: self.key_len,
             remaining_bytes: self.entries_range.end - self.entries_range.start,
+            remaining_entries: self.footer.entries_count,
         })
     }
 
@@ -239,23 +244,61 @@ impl ChunkHandle {
 }
 
 /// Iterator that streams entries from a file on-demand.
+///
+/// This iterator validates that the number of entries matches the footer's `entries_count` and
+/// that all entry bytes are consumed. It is error-fusing: after returning an error, all subsequent
+/// calls to `next()` return `None`.
 pub struct StreamingEntryIter<'a, R> {
     reader: &'a mut R,
     key_len: u32,
     remaining_bytes: u64,
+    remaining_entries: u32,
 }
 
 impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
     type Item = Result<Entry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_bytes == 0 {
+        // Check if we've consumed all expected entries
+        if self.remaining_entries == 0 {
+            // Validate: no bytes should remain
+            if self.remaining_bytes > 0 {
+                let remaining = self.remaining_bytes;
+                self.remaining_bytes = 0;
+                return Some(Err(SclsError::MalformedRecord(format!(
+                    "entry count exhausted but {} bytes remain",
+                    remaining
+                ))));
+            }
             return None;
+        }
+
+        // Check if we've consumed all bytes
+        if self.remaining_bytes == 0 {
+            let remaining = self.remaining_entries;
+            self.remaining_entries = 0;
+            return Some(Err(SclsError::MalformedRecord(format!(
+                "entry data exhausted but {} entries expected",
+                remaining
+            ))));
+        }
+
+        // Check we have enough bytes for the length prefix before reading
+        if self.remaining_bytes < 4 {
+            let remaining = self.remaining_bytes;
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
+            return Some(Err(SclsError::MalformedRecord(format!(
+                "incomplete entry length prefix: {} bytes remaining",
+                remaining
+            ))));
         }
 
         // Read 4 byte length prefix
         let mut len_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut len_buf) {
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
             return Some(Err(e.into()));
         }
         let len_body = u32::from_be_bytes(len_buf) as usize;
@@ -263,12 +306,16 @@ impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
         // Check we're not reading beyond our range
         let total_read = match 4u64.checked_add(len_body as u64) {
             None => {
+                self.remaining_bytes = 0;
+                self.remaining_entries = 0;
                 return Some(Err(SclsError::MalformedRecord(
                     "entry body length overflow".into(),
                 )));
             }
 
             Some(total_read) if total_read > self.remaining_bytes => {
+                self.remaining_bytes = 0;
+                self.remaining_entries = 0;
                 return Some(Err(SclsError::MalformedRecord(
                     "entry extends beyond chunk data".into(),
                 )));
@@ -281,6 +328,8 @@ impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
 
         // Body must be at least as large as the key
         if len_body < key_len_usize {
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
             return Some(Err(SclsError::MalformedRecord(format!(
                 "entry body too short for key: body {} bytes, key {} bytes",
                 len_body, self.key_len
@@ -290,10 +339,14 @@ impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
         // Read the entry body (key + value)
         let mut body = vec![0u8; len_body];
         if let Err(e) = self.reader.read_exact(&mut body) {
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
             return Some(Err(e.into()));
         }
 
+        // Update counters only after successful read
         self.remaining_bytes -= total_read;
+        self.remaining_entries -= 1;
 
         // Split into key and value
         let key = body[..key_len_usize].to_vec();
@@ -353,6 +406,7 @@ mod tests {
                 reader: &mut reader,
                 key_len,
                 remaining_bytes: data_len,
+                remaining_entries: num_entries as u32,
             };
 
             let result: Result<Vec<Entry>> = iter.collect();
@@ -366,10 +420,10 @@ mod tests {
             params in (1u32..=64, 1usize..=10)
                 .prop_flat_map(|(key_len, num_entries)| {
                     entries_data(key_len, num_entries)
-                        .prop_map(move |data| (key_len, data))
+                        .prop_map(move |data| (key_len, num_entries, data))
                 })
         ) {
-            let (key_len, data) = params;
+            let (key_len, num_entries, data) = params;
             let data_len = data.len() as u64;
             let mut reader = Cursor::new(data);
 
@@ -377,6 +431,7 @@ mod tests {
                 reader: &mut reader,
                 key_len,
                 remaining_bytes: data_len,
+                remaining_entries: num_entries as u32,
             };
 
             let result: Result<Vec<Entry>> = iter.collect();
@@ -400,6 +455,7 @@ mod tests {
                 reader: &mut reader,
                 key_len,
                 remaining_bytes: data_len,
+                remaining_entries: 1,
             };
 
             // Try to read one entry, should fail
@@ -423,6 +479,7 @@ mod tests {
                 reader: &mut reader,
                 key_len,
                 remaining_bytes: data_len,
+                remaining_entries: 1,
             };
 
             // Try to read one entry, should fail
