@@ -21,11 +21,19 @@ impl<R: Read + Seek> SclsReader<R> {
     }
 
     /// Returns an iterator over records in the file.
-    pub fn records(&mut self) -> RecordIter<'_, R> {
-        RecordIter {
+    ///
+    /// The iterator starts from the reader's current position. Use this to parse SCLS files that
+    /// don't start at byte 0 (e.g., embedded within another format).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying the reader's current position fails.
+    pub fn records(&mut self) -> Result<RecordIter<'_, R>> {
+        let current_offset = self.reader.stream_position()?;
+        Ok(RecordIter {
             reader: self,
-            current_offset: 0,
-        }
+            current_offset,
+        })
     }
 }
 
@@ -98,6 +106,12 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             Err(e) => return Some(Err(e.into())),
         }
 
+        // Update offset immediately after successful read, before any validation
+        self.current_offset = match self.current_offset.checked_add(4) {
+            Some(offset) => offset,
+            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+        };
+
         let payload_len = u32::from_be_bytes(len_buf);
 
         // Check the payload isn't empty
@@ -107,24 +121,19 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             )));
         }
 
-        // Update offset past length prefix
-        self.current_offset = match self.current_offset.checked_add(4) {
-            Some(offset) => offset,
-            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
-        };
-
         // Read the 1-byte record type
         let mut type_buf = [0u8; 1];
         if let Err(e) = self.reader.reader.read_exact(&mut type_buf) {
             return Some(Err(e.into()));
         }
-        let record_type = type_buf[0];
 
-        // Update offset past type byte
+        // Update offset immediately after successful read
         self.current_offset = match self.current_offset.checked_add(1) {
             Some(offset) => offset,
             None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
         };
+
+        let record_type = type_buf[0];
 
         // The remaining payload length (excluding type byte)
         let data_len = (payload_len - 1) as u64;
@@ -218,7 +227,7 @@ mod tests {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
 
-        let records: Vec<_> = reader.records().collect::<Result<_>>()?;
+        let records: Vec<_> = reader.records()?.collect::<Result<_>>()?;
         assert_eq!(records.len(), 3);
 
         // Test header
