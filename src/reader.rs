@@ -10,8 +10,8 @@ pub struct SclsReader<R> {
     reader: R,
 }
 
-// NOTE Our iterator-based reader doesn't need `Seek`, but we'll need it later when it comes to
-// verification. It might also be worthwhile having separate impls for Read and Read + Seek.
+// NOTE We need `Seek` to be able to lazily stream CHUNK records. It may be worthwhile having a
+// limited `Read`-only impl as well for, e.g., pipe access.
 impl<R: Read + Seek> SclsReader<R> {
     /// Creates a new SCLS reader from the given I/O source.
     ///
@@ -68,12 +68,8 @@ impl Record {
         match RecordType::from_byte(record_type) {
             Some(RecordType::Header) => Ok(Self::Header(data.try_into()?)),
 
-            Some(RecordType::Chunk) => {
-                // Chunks should be parsed directly from the reader, not here
-                Err(SclsError::MalformedRecord(
-                    "chunk records must be parsed directly from reader".into(),
-                ))
-            }
+            // Chunks are parsed directly from the reader, not here
+            Some(RecordType::Chunk) => unreachable!(),
 
             Some(RecordType::Manifest) => Ok(Self::Manifest(data.try_into()?)),
 

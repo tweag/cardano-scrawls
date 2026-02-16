@@ -2,7 +2,6 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
-use std::str;
 
 use crate::error::{Result, SclsError};
 use crate::types::Digest;
@@ -193,9 +192,8 @@ impl ChunkHandle {
         // Read namespace
         let mut ns_buf = vec![0u8; len_ns as usize];
         reader.read_exact(&mut ns_buf)?;
-        let namespace = str::from_utf8(&ns_buf)
-            .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace".into()))?
-            .to_string();
+        let namespace = String::from_utf8(ns_buf)
+            .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace".into()))?;
 
         // Read key_len (4 bytes)
         let mut key_len_buf = [0u8; 4];
