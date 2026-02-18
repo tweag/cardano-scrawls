@@ -93,6 +93,117 @@ pub struct ChunkHandle {
 }
 
 impl ChunkHandle {
+    /// Iterates over the entries in this chunk, invoking the closure for each one.
+    ///
+    /// The reader is seeked to the start of each entry's key before the closure is called. The
+    /// closure receives the reader, the key length, and the value length in bytes. The value
+    /// immediately follows the key in the stream. The closure may leave the reader at any
+    /// position; it will be repositioned automatically before the next entry.
+    ///
+    /// This method performs a second pass over the chunk data and does not interfere with entry
+    /// iteration via [`ChunkHandle::entries`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Seeking or reading from the reader fails
+    /// - The entry data is structurally malformed (e.g. length prefix overflow,
+    ///   entry extends beyond chunk bounds, entry count mismatches byte count)
+    /// - The closure returns an error
+    pub fn for_each_entry<R, F>(&self, reader: &mut R, mut f: F) -> Result<()>
+    where
+        R: Read + Seek,
+        F: FnMut(
+            &mut R, // reader
+            u64,    // key length
+            u64,    // value length
+        ) -> Result<()>,
+    {
+        let mut remaining_bytes = self.entries_range.end - self.entries_range.start;
+        let mut remaining_entries = self.footer.entries_count;
+
+        let mut pos = self.entries_range.start;
+        reader.seek(SeekFrom::Start(pos))?;
+
+        loop {
+            // Check if we've consumed all expected entries
+            if remaining_entries == 0 {
+                // Validate: no bytes should remain
+                if remaining_bytes > 0 {
+                    return Err(SclsError::MalformedRecord(format!(
+                        "entry count exhausted, but {} bytes remain",
+                        remaining_bytes
+                    )));
+                }
+                break;
+            }
+
+            // Check we've consumed all the bytes
+            if remaining_bytes == 0 {
+                return Err(SclsError::MalformedRecord(format!(
+                    "entry data exhausted, but {} entries expected",
+                    remaining_entries
+                )));
+            }
+
+            // Check we have enough bytes for the length prefix before reading
+            if remaining_bytes < 4 {
+                return Err(SclsError::MalformedRecord(format!(
+                    "incomplete entry length prefix: {} bytes remaining",
+                    remaining_bytes
+                )));
+            }
+
+            // Read 4 byte length prefix
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut len_buf) {
+                return Err(e.into());
+            }
+            let len_body = u32::from_be_bytes(len_buf);
+
+            // Check we're not reading beyond our range
+            let total_read = match 4u64.checked_add(len_body as u64) {
+                None => {
+                    return Err(SclsError::MalformedRecord(
+                        "entry body length overflow".into(),
+                    ));
+                }
+
+                Some(bytes) if bytes > remaining_bytes => {
+                    return Err(SclsError::MalformedRecord(
+                        "entry extends beyond chunk data".into(),
+                    ));
+                }
+
+                Some(bytes) => bytes,
+            };
+
+            let key_len = self.key_len;
+
+            // Body must be at least as large as the key
+            if len_body < key_len {
+                return Err(SclsError::MalformedRecord(format!(
+                    "entry body too short for key: body {} bytes, key {} bytes",
+                    len_body, self.key_len
+                )));
+            }
+
+            let value_len = len_body - key_len;
+
+            // Pass the key and value lengths to the closure
+            f(reader, key_len as u64, value_len as u64)?;
+
+            remaining_bytes -= total_read;
+            remaining_entries -= 1;
+            pos += total_read;
+
+            // Seek to next entry
+            reader.seek(SeekFrom::Start(pos))?;
+        }
+
+        Ok(())
+    }
+
     /// Returns an iterator that streams entries from the file on-demand.
     ///
     /// Each entry is read from disk as the iterator advances.
@@ -160,7 +271,7 @@ impl ChunkHandle {
         let mut buf = [0u8; 8];
         reader.read_exact(&mut buf)?;
         let seqno = u64::from_be_bytes(buf);
-
+        /*value length*/
         // Read format (1 byte)
         let mut format_buf = [0u8; 1];
         reader.read_exact(&mut format_buf)?;
