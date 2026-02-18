@@ -33,6 +33,7 @@ impl<R: Read + Seek> SclsReader<R> {
         Ok(RecordIter {
             reader: self,
             current_offset,
+            failed: false,
         })
     }
 }
@@ -41,6 +42,7 @@ impl<R: Read + Seek> SclsReader<R> {
 pub struct RecordIter<'a, R> {
     reader: &'a mut SclsReader<R>,
     current_offset: u64,
+    failed: bool,
 }
 
 /// A parsed record from an SCLS file.
@@ -92,6 +94,11 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
     type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Terminate the iterator if it has failed midway
+        if self.failed {
+            return None;
+        }
+
         // Read the 4-byte length prefix
         // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at the
         // end of the file won't be picked up as a truncated/corrupted file; see issue #9.
@@ -99,19 +106,26 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         match self.reader.reader.read_exact(&mut len_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => return Some(Err(e.into())),
+            Err(e) => {
+                self.failed = true;
+                return Some(Err(e.into()));
+            }
         }
 
         // Update offset immediately after successful read, before any validation
         self.current_offset = match self.current_offset.checked_add(4) {
             Some(offset) => offset,
-            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+            None => {
+                self.failed = true;
+                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+            }
         };
 
         let payload_len = u32::from_be_bytes(len_buf);
 
         // Check the payload isn't empty
         if payload_len == 0 {
+            self.failed = true;
             return Some(Err(SclsError::MalformedRecord(
                 "zero length payload record".into(),
             )));
@@ -120,13 +134,17 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         // Read the 1-byte record type
         let mut type_buf = [0u8; 1];
         if let Err(e) = self.reader.reader.read_exact(&mut type_buf) {
+            self.failed = true;
             return Some(Err(e.into()));
         }
 
         // Update offset immediately after successful read
         self.current_offset = match self.current_offset.checked_add(1) {
             Some(offset) => offset,
-            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+            None => {
+                self.failed = true;
+                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+            }
         };
 
         let record_type = type_buf[0];
@@ -146,7 +164,10 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             // Update offset to end of record
             self.current_offset = match self.current_offset.checked_add(data_len) {
                 Some(offset) => offset,
-                None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+                None => {
+                    self.failed = true;
+                    return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+                }
             };
 
             // Seek to end of record for next iteration
@@ -155,6 +176,7 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
                 .reader
                 .seek(std::io::SeekFrom::Start(self.current_offset))
             {
+                self.failed = true;
                 return Some(Err(e.into()));
             }
 
@@ -164,13 +186,17 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         // For non-chunk records, read the full payload into a buffer
         let mut data = vec![0u8; data_len as usize];
         if let Err(e) = self.reader.reader.read_exact(&mut data) {
+            self.failed = true;
             return Some(Err(e.into()));
         }
 
         // Update offset
         self.current_offset = match self.current_offset.checked_add(data_len) {
             Some(offset) => offset,
-            None => return Some(Err(SclsError::MalformedRecord("offset overflow".into()))),
+            None => {
+                self.failed = true;
+                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+            }
         };
 
         // Parse based on type
