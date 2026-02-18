@@ -334,9 +334,18 @@ impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
             ))));
         }
 
-        // Read the entry body (key + value)
-        let mut body = vec![0u8; len_body];
-        if let Err(e) = self.reader.read_exact(&mut body) {
+        // Read the entry body: Key first
+        let mut key = vec![0u8; key_len_usize];
+        if let Err(e) = self.reader.read_exact(&mut key) {
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
+            return Some(Err(e.into()));
+        }
+
+        // Then the value
+        let value_len = len_body - key_len_usize; // Safe: already validated above
+        let mut value = vec![0u8; value_len];
+        if let Err(e) = self.reader.read_exact(&mut value) {
             self.remaining_bytes = 0;
             self.remaining_entries = 0;
             return Some(Err(e.into()));
@@ -345,10 +354,6 @@ impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
         // Update counters only after successful read
         self.remaining_bytes -= total_read;
         self.remaining_entries -= 1;
-
-        // Split into key and value
-        let key = body[..key_len_usize].to_vec();
-        let value = body[key_len_usize..].to_vec();
 
         Some(Ok(Entry { key, value }))
     }
