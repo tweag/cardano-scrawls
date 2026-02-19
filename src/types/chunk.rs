@@ -7,6 +7,11 @@ use crate::error::{Result, SclsError};
 use crate::types::digest::HASH_SIZE;
 use crate::types::Digest;
 
+use blake2b_simd::Params;
+
+/// Maximum block size to feed the Blake2b hashing function.
+const BLOCK_SIZE: usize = 8 * 1024; // 8 KiB
+
 /// Compression format for chunk data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -373,6 +378,74 @@ impl Chunk {
             if current_pos != pos {
                 reader.seek(SeekFrom::Start(pos))?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Verify the chunk digest from the entry digests.
+    ///
+    /// - Each entry's digest is computed as `H(0x01 || ns_str || key || value)`.
+    /// - The chunk digest is computed as `H(concat(digest(e) for e in entries))`.
+    /// - `H` is the hashing function; viz. Blake2b-224.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Parsing or I/O failure
+    /// - Digest mismatch
+    pub fn verify<R: Read + Seek>(&self, reader: &mut R) -> Result<()> {
+        let mut entry_hashes: Vec<Digest> = Vec::with_capacity(self.footer.entries_count as usize);
+
+        self.for_each_entry(reader, |reader, key_len, value_len| {
+            let mut hash_state = Params::new().hash_length(HASH_SIZE).to_state();
+
+            // Hash preamble
+            hash_state.update(&[0x01]);
+            hash_state.update(self.namespace.as_bytes());
+
+            // Entry hash
+            let mut buffer = [0u8; BLOCK_SIZE];
+            let mut remaining = key_len + value_len;
+
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(BLOCK_SIZE);
+                let buf = &mut buffer[..to_read];
+                reader.read_exact(buf)?;
+
+                hash_state.update(buf);
+
+                remaining -= to_read as u64;
+            }
+
+            // It's safe to unwrap here because we know our hash is HASH_SIZE bytes long
+            let hash_bytes: [u8; HASH_SIZE] = hash_state.finalize().as_bytes().try_into().unwrap();
+            entry_hashes.push(Digest::from(hash_bytes));
+
+            Ok(())
+        })?;
+
+        // Compute chunk hash from concatenated entry hashes
+        let entry_digests: Vec<u8> = entry_hashes
+            .iter()
+            .flat_map(|d| d.as_bytes().iter().copied())
+            .collect();
+
+        let chunk_hash: [u8; HASH_SIZE] = Params::new()
+            .hash_length(HASH_SIZE)
+            .to_state()
+            .update(&entry_digests)
+            .finalize()
+            .as_bytes()
+            .try_into()
+            .unwrap(); // Again, this is safe
+
+        // Compare computed with expected chunk hashes
+        let expected = self.footer.digest;
+        let computed = Digest::from(chunk_hash);
+
+        if expected != computed {
+            return Err(SclsError::DigestMismatch { expected, computed });
         }
 
         Ok(())
