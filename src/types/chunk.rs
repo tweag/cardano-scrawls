@@ -48,7 +48,7 @@ impl TryFrom<u8> for ChunkFormat {
     }
 }
 
-/// A single key-value entry within a chunk
+/// A single key-value entry within a chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Fixed-size key (length determined by chunk's key_len)
@@ -56,6 +56,56 @@ pub struct Entry {
 
     /// CBOR-encoded value
     pub value: Vec<u8>,
+}
+
+impl Entry {
+    /// Materialise an entry by reading the appropriate number of bytes for the key and value,
+    /// respectively.
+    ///
+    /// The reader argument _should_ be at the correct position to begin without seeking and the
+    /// wire format guarantees that the key and value payloads are juxtaposed.
+    ///
+    /// This is engineered to happen with and should be used in the closure argument of
+    /// [`Chunk::for_each_entry`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Entry component size overflows
+    /// - Memory allocation errors
+    /// - I/O errors occur during reading
+    pub fn materialise<R: Read>(reader: &mut R, key_len: u64, value_len: u64) -> Result<Self> {
+        // Allocate the necessary space
+        let key_len = usize::try_from(key_len)
+            .map_err(|_| SclsError::MalformedRecord("entry key length overflow".into()))?;
+
+        let mut key = Vec::new();
+        key.try_reserve_exact(key_len).map_err(|_| {
+            SclsError::MalformedRecord("out of memory: cannot materialise entry key".into())
+        })?;
+        key.resize(key_len, 0u8);
+
+        let value_len = usize::try_from(value_len)
+            .map_err(|_| SclsError::MalformedRecord("entry value length overflow".into()))?;
+
+        let mut value = Vec::new();
+        value.try_reserve_exact(value_len).map_err(|_| {
+            SclsError::MalformedRecord("out of memory: cannot materialise entry value".into())
+        })?;
+        value.resize(value_len, 0u8);
+
+        // Read the entry key
+        if let Err(e) = reader.read_exact(&mut key) {
+            return Err(e.into());
+        }
+
+        // Read the entry value
+        if let Err(e) = reader.read_exact(&mut value) {
+            return Err(e.into());
+        }
+
+        Ok(Self { key, value })
+    }
 }
 
 /// Footer at the end of each chunk containing integrity information.
@@ -68,11 +118,12 @@ pub struct ChunkFooter {
     pub digest: Digest,
 }
 
-/// A handle to a chunk in the SCLS file.
+/// A chunk record in the SCLS file.
 ///
-/// Entry data is loaded lazily when calling [`entries`](ChunkHandle::entries).
+/// Entry data can be iterated through with [`Chunk::for_each_entry`] and materialised with
+/// [`Entry::materialise`], for example.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkHandle {
+pub struct Chunk {
     /// Sequential chunk number
     pub seqno: u64,
 
@@ -92,32 +143,7 @@ pub struct ChunkHandle {
     entries_range: Range<u64>,
 }
 
-impl ChunkHandle {
-    /// Returns an iterator that streams entries from the file on-demand.
-    ///
-    /// Each entry is read from disk as the iterator advances.
-    /// This requires mutable access to the reader.
-    ///
-    /// This method seeks the reader to the start of the entry data. The iterator will advance the
-    /// reader position as entries are consumed. The reader position after iteration is unspecified
-    /// and depends on where iteration stopped.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if seeking to the entry data fails.
-    pub fn entries<'a, R: Read + Seek>(
-        &self,
-        reader: &'a mut R,
-    ) -> Result<StreamingEntryIter<'a, R>> {
-        reader.seek(SeekFrom::Start(self.entries_range.start))?;
-        Ok(StreamingEntryIter {
-            reader,
-            key_len: self.key_len,
-            remaining_bytes: self.entries_range.end - self.entries_range.start,
-            remaining_entries: self.footer.entries_count,
-        })
-    }
-
+impl Chunk {
     /// Parses a chunk record directly from a reader, achieving true lazy loading.
     ///
     /// This method reads only the chunk header and footer from the reader, calculating the byte
@@ -230,7 +256,7 @@ impl ChunkHandle {
             digest,
         };
 
-        Ok(ChunkHandle {
+        Ok(Chunk {
             seqno,
             format,
             namespace,
@@ -239,123 +265,116 @@ impl ChunkHandle {
             entries_range: entries_start..entries_end,
         })
     }
-}
 
-/// Iterator that streams entries from a file on-demand.
-///
-/// This iterator validates that the number of entries matches the footer's `entries_count` and
-/// that all entry bytes are consumed. It is error-fusing: after returning an error, all subsequent
-/// calls to `next()` return `None`.
-pub struct StreamingEntryIter<'a, R> {
-    reader: &'a mut R,
-    key_len: u32,
-    remaining_bytes: u64,
-    remaining_entries: u32,
-}
+    /// Iterates over the entries in this chunk, invoking the closure for each one.
+    ///
+    /// The reader is seeked to the start of each entry's key before the closure is called. The
+    /// closure receives the reader, the key length, and the value length in bytes. The value
+    /// immediately follows the key in the stream. The closure may leave the reader at any
+    /// position; it will be repositioned automatically before the next entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Seeking or reading from the reader fails
+    /// - The entry data is structurally malformed (e.g. length prefix overflow,
+    ///   entry extends beyond chunk bounds, entry count mismatches byte count)
+    /// - The closure returns an error
+    pub fn for_each_entry<R, F>(&self, reader: &mut R, mut f: F) -> Result<()>
+    where
+        R: Read + Seek,
+        F: FnMut(
+            &mut R, // reader
+            u64,    // key length
+            u64,    // value length
+        ) -> Result<()>,
+    {
+        let mut remaining_bytes = self.entries_range.end - self.entries_range.start;
+        let mut remaining_entries = self.footer.entries_count;
 
-impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
-    type Item = Result<Entry>;
+        let mut pos = self.entries_range.start;
+        reader.seek(SeekFrom::Start(pos))?;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        // Check if we've consumed all expected entries
-        if self.remaining_entries == 0 {
-            // Validate: no bytes should remain
-            if self.remaining_bytes > 0 {
-                let remaining = self.remaining_bytes;
-                self.remaining_bytes = 0;
-                return Some(Err(SclsError::MalformedRecord(format!(
-                    "entry count exhausted but {} bytes remain",
-                    remaining
-                ))));
+        loop {
+            // Check if we've consumed all expected entries
+            if remaining_entries == 0 {
+                // Validate: no bytes should remain
+                if remaining_bytes > 0 {
+                    return Err(SclsError::MalformedRecord(format!(
+                        "entry count exhausted, but {} bytes remain",
+                        remaining_bytes
+                    )));
+                }
+                break;
             }
-            return None;
-        }
 
-        // Check if we've consumed all bytes
-        if self.remaining_bytes == 0 {
-            let remaining = self.remaining_entries;
-            self.remaining_entries = 0;
-            return Some(Err(SclsError::MalformedRecord(format!(
-                "entry data exhausted but {} entries expected",
-                remaining
-            ))));
-        }
-
-        // Check we have enough bytes for the length prefix before reading
-        if self.remaining_bytes < 4 {
-            let remaining = self.remaining_bytes;
-            self.remaining_bytes = 0;
-            self.remaining_entries = 0;
-            return Some(Err(SclsError::MalformedRecord(format!(
-                "incomplete entry length prefix: {} bytes remaining",
-                remaining
-            ))));
-        }
-
-        // Read 4 byte length prefix
-        let mut len_buf = [0u8; 4];
-        if let Err(e) = self.reader.read_exact(&mut len_buf) {
-            self.remaining_bytes = 0;
-            self.remaining_entries = 0;
-            return Some(Err(e.into()));
-        }
-        let len_body = u32::from_be_bytes(len_buf) as usize;
-
-        // Check we're not reading beyond our range
-        let total_read = match 4u64.checked_add(len_body as u64) {
-            None => {
-                self.remaining_bytes = 0;
-                self.remaining_entries = 0;
-                return Some(Err(SclsError::MalformedRecord(
-                    "entry body length overflow".into(),
+            // Check we've consumed all the bytes
+            if remaining_bytes == 0 {
+                return Err(SclsError::MalformedRecord(format!(
+                    "entry data exhausted, but {} entries expected",
+                    remaining_entries
                 )));
             }
 
-            Some(total_read) if total_read > self.remaining_bytes => {
-                self.remaining_bytes = 0;
-                self.remaining_entries = 0;
-                return Some(Err(SclsError::MalformedRecord(
-                    "entry extends beyond chunk data".into(),
+            // Check we have enough bytes for the length prefix before reading
+            if remaining_bytes < 4 {
+                return Err(SclsError::MalformedRecord(format!(
+                    "incomplete entry length prefix: {} bytes remaining",
+                    remaining_bytes
                 )));
             }
 
-            Some(total_read) => total_read,
-        };
+            // Read 4 byte length prefix
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut len_buf) {
+                return Err(e.into());
+            }
+            let len_body = u32::from_be_bytes(len_buf);
 
-        let key_len_usize = self.key_len as usize;
+            // Check we're not reading beyond our range
+            let total_read = match 4u64.checked_add(len_body as u64) {
+                None => {
+                    return Err(SclsError::MalformedRecord(
+                        "entry body length overflow".into(),
+                    ));
+                }
 
-        // Body must be at least as large as the key
-        if len_body < key_len_usize {
-            self.remaining_bytes = 0;
-            self.remaining_entries = 0;
-            return Some(Err(SclsError::MalformedRecord(format!(
-                "entry body too short for key: body {} bytes, key {} bytes",
-                len_body, self.key_len
-            ))));
+                Some(bytes) if bytes > remaining_bytes => {
+                    return Err(SclsError::MalformedRecord(
+                        "entry extends beyond chunk data".into(),
+                    ));
+                }
+
+                Some(bytes) => bytes,
+            };
+
+            let key_len = self.key_len;
+
+            // Body must be at least as large as the key
+            if len_body < key_len {
+                return Err(SclsError::MalformedRecord(format!(
+                    "entry body too short for key: body {} bytes, key {} bytes",
+                    len_body, self.key_len
+                )));
+            }
+
+            let value_len = len_body - key_len;
+
+            // Pass the key and value lengths to the closure
+            f(reader, key_len as u64, value_len as u64)?;
+
+            remaining_bytes -= total_read;
+            remaining_entries -= 1;
+            pos += total_read;
+
+            // Seek to next entry, if necessary
+            let current_pos = reader.stream_position()?;
+            if current_pos != pos {
+                reader.seek(SeekFrom::Start(pos))?;
+            }
         }
 
-        // Read the entry body: Key first
-        let mut key = vec![0u8; key_len_usize];
-        if let Err(e) = self.reader.read_exact(&mut key) {
-            self.remaining_bytes = 0;
-            self.remaining_entries = 0;
-            return Some(Err(e.into()));
-        }
-
-        // Then the value
-        let value_len = len_body - key_len_usize; // Safe: already validated above
-        let mut value = vec![0u8; value_len];
-        if let Err(e) = self.reader.read_exact(&mut value) {
-            self.remaining_bytes = 0;
-            self.remaining_entries = 0;
-            return Some(Err(e.into()));
-        }
-
-        // Update counters only after successful read
-        self.remaining_bytes -= total_read;
-        self.remaining_entries -= 1;
-
-        Some(Ok(Entry { key, value }))
+        Ok(())
     }
 }
 
@@ -392,6 +411,29 @@ mod tests {
             .prop_map(|entries| entries.concat())
     }
 
+    // Build a minimal valid chunk payload wrapping `entry_data`, then parse it into a `Chunk`.
+    // The returned cursor is positioned at an unspecified location; `for_each_entry` will seek
+    // as needed.
+    fn make_chunk(key_len: u32, num_entries: u32, entry_data: Vec<u8>) -> (Chunk, Cursor<Vec<u8>>) {
+        let namespace = b"test";
+        let len_ns: u32 = namespace.len() as u32;
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u64.to_be_bytes()); // seqno
+        payload.push(0x00); // format (Raw)
+        payload.extend_from_slice(&len_ns.to_be_bytes()); // len_ns
+        payload.extend_from_slice(namespace); // namespace
+        payload.extend_from_slice(&key_len.to_be_bytes()); // key_len
+        payload.extend_from_slice(&entry_data); // entries
+        payload.extend_from_slice(&num_entries.to_be_bytes()); // footer: entries_count
+        payload.extend_from_slice(&[0u8; 28]); // footer: digest (placeholder)
+
+        let payload_len = payload.len() as u32;
+        let mut cursor = Cursor::new(payload);
+        let chunk = Chunk::parse(&mut cursor, 0, payload_len).unwrap();
+        (chunk, cursor)
+    }
+
     proptest! {
         #[test]
         fn parse_entries_count_matches(
@@ -402,20 +444,15 @@ mod tests {
                 })
         ) {
             let (key_len, num_entries, data) = params;
-            let data_len = data.len() as u64;
-            let mut reader = Cursor::new(data);
+            let (chunk, mut cursor) = make_chunk(key_len, num_entries as u32, data);
 
-            let iter = StreamingEntryIter {
-                reader: &mut reader,
-                key_len,
-                remaining_bytes: data_len,
-                remaining_entries: num_entries as u32,
-            };
+            let mut count = 0usize;
+            chunk.for_each_entry(&mut cursor, |_reader, _key_len, _val_len| {
+                count += 1;
+                Ok(())
+            })?;
 
-            let result: Result<Vec<Entry>> = iter.collect();
-            let entries = result?;
-
-            prop_assert_eq!(entries.len(), num_entries);
+            prop_assert_eq!(count, num_entries);
         }
 
         #[test]
@@ -427,20 +464,15 @@ mod tests {
                 })
         ) {
             let (key_len, num_entries, data) = params;
-            let data_len = data.len() as u64;
-            let mut reader = Cursor::new(data);
+            let (chunk, mut cursor) = make_chunk(key_len, num_entries as u32, data);
 
-            let iter = StreamingEntryIter {
-                reader: &mut reader,
-                key_len,
-                remaining_bytes: data_len,
-                remaining_entries: num_entries as u32,
-            };
+            let mut entries: Vec<Entry> = Vec::new();
+            chunk.for_each_entry(&mut cursor, |reader, kl, vl| {
+                entries.push(Entry::materialise(reader, kl, vl)?);
+                Ok(())
+            })?;
 
-            let result: Result<Vec<Entry>> = iter.collect();
-            let entries = result?;
-
-            for entry in entries {
+            for entry in &entries {
                 prop_assert_eq!(entry.key.len(), key_len as usize);
             }
         }
@@ -451,20 +483,10 @@ mod tests {
         ) {
             // Only 2 bytes instead of 4 for length prefix
             let data = vec![0x00, 0x01];
-            let data_len = data.len() as u64;
-            let mut reader = Cursor::new(data);
+            let (chunk, mut cursor) = make_chunk(key_len, 1, data);
 
-            let mut iter = StreamingEntryIter {
-                reader: &mut reader,
-                key_len,
-                remaining_bytes: data_len,
-                remaining_entries: 1,
-            };
-
-            // Try to read one entry, should fail
-            let result = iter.next();
-            prop_assert!(result.is_some());
-            prop_assert!(result.unwrap().is_err());
+            let result = chunk.for_each_entry(&mut cursor, |_reader, _kl, _vl| Ok(()));
+            prop_assert!(result.is_err());
         }
 
         #[test]
@@ -475,20 +497,10 @@ mod tests {
             let mut data = 2u32.to_be_bytes().to_vec();
             data.extend_from_slice(&[0xff, 0xff]);
 
-            let data_len = data.len() as u64;
-            let mut reader = Cursor::new(data);
+            let (chunk, mut cursor) = make_chunk(key_len, 1, data);
 
-            let mut iter = StreamingEntryIter {
-                reader: &mut reader,
-                key_len,
-                remaining_bytes: data_len,
-                remaining_entries: 1,
-            };
-
-            // Try to read one entry, should fail
-            let result = iter.next();
-            prop_assert!(result.is_some());
-            prop_assert!(result.unwrap().is_err());
+            let result = chunk.for_each_entry(&mut cursor, |_reader, _kl, _vl| Ok(()));
+            prop_assert!(result.is_err());
         }
     }
 }
