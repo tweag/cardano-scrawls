@@ -50,6 +50,71 @@ pub struct NamespaceInfo {
     pub digest: Digest,
 }
 
+impl NamespaceInfo {
+    /// Parses the list of namespace info structures.
+    /// Returns the list and number of bytes consumed.
+    fn parse_list(data: &[u8]) -> Result<(Vec<Self>, usize)> {
+        let mut namespaces = Vec::new();
+        let mut pos: usize = 0;
+
+        loop {
+            let needed_len = pos.checked_add(4).ok_or_else(|| {
+                SclsError::MalformedRecord("namespace_info length overflow".into())
+            })?;
+
+            if data.len() < needed_len {
+                return Err(SclsError::MalformedRecord(
+                    "incomplete namespace_info length".into(),
+                ));
+            }
+
+            let len_ns = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            // len_ns == 0 is the sentinel value indicating when to stop
+            if len_ns == 0 {
+                break;
+            }
+
+            // Parse ns_info: entries_count(8) + chunks_count(8) + name(len_ns) + digest(28)
+            let required = 8 + 8 + len_ns + 28;
+            let min_len = pos
+                .checked_add(required)
+                .ok_or_else(|| SclsError::MalformedRecord("ns_info length overflow".into()))?;
+
+            if data.len() < min_len {
+                return Err(SclsError::MalformedRecord(
+                    "incomplete namespace_info structure".into(),
+                ));
+            }
+
+            let entries_count = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+
+            let chunks_count = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+
+            let name = str::from_utf8(&data[pos..pos + len_ns])
+                .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace name".into()))?
+                .to_string();
+            pos += len_ns;
+
+            let digest_bytes: [u8; 28] = data[pos..pos + 28].try_into().unwrap();
+            let digest = digest_bytes.into();
+            pos += 28;
+
+            namespaces.push(Self {
+                entries_count,
+                chunks_count,
+                name,
+                digest,
+            });
+        }
+
+        Ok((namespaces, pos))
+    }
+}
+
 /// Summary metadata about file creation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -61,6 +126,38 @@ pub struct Summary {
 
     /// Comment
     pub comment: Option<String>,
+}
+
+impl Summary {
+    /// Parses the summary section (3 `tstr` fields).
+    /// Returns the summary and number of bytes consumed.
+    fn parse(data: &[u8]) -> Result<(Self, usize)> {
+        let mut pos = 0;
+
+        let (created_at, len) = parse_tstr(&data[pos..])?;
+        pos += len;
+
+        let (tool, len) = parse_tstr(&data[pos..])?;
+        pos += len;
+
+        let (comment_str, len) = parse_tstr(&data[pos..])?;
+        pos += len;
+
+        let comment = if comment_str.is_empty() {
+            None
+        } else {
+            Some(comment_str)
+        };
+
+        Ok((
+            Self {
+                created_at,
+                tool,
+                comment,
+            },
+            pos,
+        ))
+    }
 }
 
 impl TryFrom<&[u8]> for Manifest {
@@ -94,11 +191,11 @@ impl TryFrom<&[u8]> for Manifest {
         pos += 8;
 
         // Parse summary (3 length-prefixed strings)
-        let (summary, bytes_read) = parse_summary(&value[pos..])?;
+        let (summary, bytes_read) = Summary::parse(&value[pos..])?;
         pos += bytes_read;
 
         // Parse namespace_info (repeated until len_ns == 0)
-        let (namespace_info, bytes_read) = parse_namespace_info_list(&value[pos..])?;
+        let (namespace_info, bytes_read) = NamespaceInfo::parse_list(&value[pos..])?;
         pos += bytes_read;
 
         // Parse footer fields
@@ -170,99 +267,6 @@ fn parse_tstr(data: &[u8]) -> Result<(String, usize)> {
         .to_string();
 
     Ok((s, total_len))
-}
-
-/// Parses the summary section (3 `tstr` fields).
-/// Returns the summary and number of bytes consumed.
-fn parse_summary(data: &[u8]) -> Result<(Summary, usize)> {
-    let mut pos = 0;
-
-    let (created_at, len) = parse_tstr(&data[pos..])?;
-    pos += len;
-
-    let (tool, len) = parse_tstr(&data[pos..])?;
-    pos += len;
-
-    let (comment_str, len) = parse_tstr(&data[pos..])?;
-    pos += len;
-
-    let comment = if comment_str.is_empty() {
-        None
-    } else {
-        Some(comment_str)
-    };
-
-    Ok((
-        Summary {
-            created_at,
-            tool,
-            comment,
-        },
-        pos,
-    ))
-}
-
-/// Parses the list of namespace info structures.
-/// Returns the list and number of bytes consumed.
-fn parse_namespace_info_list(data: &[u8]) -> Result<(Vec<NamespaceInfo>, usize)> {
-    let mut namespaces = Vec::new();
-    let mut pos: usize = 0;
-
-    loop {
-        let needed_len = pos
-            .checked_add(4)
-            .ok_or_else(|| SclsError::MalformedRecord("namespace_info length overflow".into()))?;
-
-        if data.len() < needed_len {
-            return Err(SclsError::MalformedRecord(
-                "incomplete namespace_info length".into(),
-            ));
-        }
-
-        let len_ns = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-
-        // len_ns == 0 is the sentinel value indicating when to stop
-        if len_ns == 0 {
-            break;
-        }
-
-        // Parse ns_info: entries_count(8) + chunks_count(8) + name(len_ns) + digest(28)
-        let required = 8 + 8 + len_ns + 28;
-        let min_len = pos
-            .checked_add(required)
-            .ok_or_else(|| SclsError::MalformedRecord("ns_info length overflow".into()))?;
-
-        if data.len() < min_len {
-            return Err(SclsError::MalformedRecord(
-                "incomplete namespace_info structure".into(),
-            ));
-        }
-
-        let entries_count = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        let chunks_count = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        let name = str::from_utf8(&data[pos..pos + len_ns])
-            .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace name".into()))?
-            .to_string();
-        pos += len_ns;
-
-        let digest_bytes: [u8; 28] = data[pos..pos + 28].try_into().unwrap();
-        let digest = digest_bytes.into();
-        pos += 28;
-
-        namespaces.push(NamespaceInfo {
-            entries_count,
-            chunks_count,
-            name,
-            digest,
-        });
-    }
-
-    Ok((namespaces, pos))
 }
 
 #[cfg(test)]

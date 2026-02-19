@@ -3,15 +3,15 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::types::{Chunk, Header, Manifest, RecordType};
+use crate::types::{ChunkHandle, Header, Manifest, RecordType};
 
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {
     reader: R,
 }
 
-// NOTE Our iterator-based reader doesn't need `Seek`, but we'll need it later when it comes to
-// verification. It might also be worthwhile having separate impls for Read and Read + Seek.
+// NOTE We need `Seek` to be able to lazily stream CHUNK records. It may be worthwhile having a
+// limited `Read`-only impl as well for, e.g., pipe access.
 impl<R: Read + Seek> SclsReader<R> {
     /// Creates a new SCLS reader from the given I/O source.
     ///
@@ -21,14 +21,28 @@ impl<R: Read + Seek> SclsReader<R> {
     }
 
     /// Returns an iterator over records in the file.
-    pub fn records(&mut self) -> RecordIter<'_, R> {
-        RecordIter { reader: self }
+    ///
+    /// The iterator starts from the reader's current position. Use this to parse SCLS files that
+    /// don't start at byte 0 (e.g., embedded within another format).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying the reader's current position fails.
+    pub fn records(&mut self) -> Result<RecordIter<'_, R>> {
+        let current_offset = self.reader.stream_position()?;
+        Ok(RecordIter {
+            reader: self,
+            current_offset,
+            failed: false,
+        })
     }
 }
 
 /// An iterator over records in an SCLS file.
 pub struct RecordIter<'a, R> {
     reader: &'a mut SclsReader<R>,
+    current_offset: u64,
+    failed: bool,
 }
 
 /// A parsed record from an SCLS file.
@@ -37,8 +51,8 @@ pub enum Record {
     /// File header
     Header(Header),
 
-    /// Data chunk
-    Chunk(Chunk),
+    /// Data chunk (with lazy loading)
+    Chunk(ChunkHandle),
 
     /// Manifest
     Manifest(Manifest),
@@ -47,10 +61,44 @@ pub enum Record {
     Unknown { record_type: u8, data: Vec<u8> },
 }
 
+impl Record {
+    /// Parses a non-chunk record from its type byte and payload data.
+    ///
+    /// Note: Chunk records are parsed directly from the reader in `RecordIter::next` to achieve
+    /// lazy loading, so this method will return an error for chunk types.
+    fn parse(record_type: u8, data: &[u8]) -> Result<Self> {
+        match RecordType::from_byte(record_type) {
+            Some(RecordType::Header) => Ok(Self::Header(data.try_into()?)),
+
+            // Chunks are parsed directly from the reader, not here
+            Some(RecordType::Chunk) => unreachable!(),
+
+            Some(RecordType::Manifest) => Ok(Self::Manifest(data.try_into()?)),
+
+            // Future/unimplemented types
+            Some(_) => Ok(Self::Unknown {
+                record_type,
+                data: data.to_vec(),
+            }),
+
+            // Actually unknown
+            None => Ok(Self::Unknown {
+                record_type,
+                data: data.to_vec(),
+            }),
+        }
+    }
+}
+
 impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
     type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Terminate the iterator if it has failed midway
+        if self.failed {
+            return None;
+        }
+
         // Read the 4-byte length prefix
         // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at the
         // end of the file won't be picked up as a truncated/corrupted file; see issue #9.
@@ -58,13 +106,26 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         match self.reader.reader.read_exact(&mut len_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => return Some(Err(e.into())),
+            Err(e) => {
+                self.failed = true;
+                return Some(Err(e.into()));
+            }
         }
+
+        // Update offset immediately after successful read, before any validation
+        self.current_offset = match self.current_offset.checked_add(4) {
+            Some(offset) => offset,
+            None => {
+                self.failed = true;
+                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+            }
+        };
 
         let payload_len = u32::from_be_bytes(len_buf);
 
         // Check the payload isn't empty
         if payload_len == 0 {
+            self.failed = true;
             return Some(Err(SclsError::MalformedRecord(
                 "zero length payload record".into(),
             )));
@@ -73,36 +134,73 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
         // Read the 1-byte record type
         let mut type_buf = [0u8; 1];
         if let Err(e) = self.reader.reader.read_exact(&mut type_buf) {
+            self.failed = true;
             return Some(Err(e.into()));
         }
+
+        // Update offset immediately after successful read
+        self.current_offset = match self.current_offset.checked_add(1) {
+            Some(offset) => offset,
+            None => {
+                self.failed = true;
+                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+            }
+        };
+
         let record_type = type_buf[0];
 
-        // Read the remaining payload
-        let data_len = (payload_len - 1) as usize;
-        let mut data = vec![0u8; data_len];
+        // The remaining payload length (excluding type byte)
+        let data_len = (payload_len - 1) as u64;
+
+        // Handle chunks specially: parse directly from reader without buffering
+        if RecordType::from_byte(record_type) == Some(RecordType::Chunk) {
+            // Current position is payload start (after type byte)
+            let payload_start = self.current_offset;
+
+            // Parse chunk directly from reader (reads only header + footer)
+            let chunk_result =
+                ChunkHandle::parse(&mut self.reader.reader, payload_start, data_len as u32);
+
+            // Update offset to end of record
+            self.current_offset = match self.current_offset.checked_add(data_len) {
+                Some(offset) => offset,
+                None => {
+                    self.failed = true;
+                    return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+                }
+            };
+
+            // Seek to end of record for next iteration
+            if let Err(e) = self
+                .reader
+                .reader
+                .seek(std::io::SeekFrom::Start(self.current_offset))
+            {
+                self.failed = true;
+                return Some(Err(e.into()));
+            }
+
+            return Some(chunk_result.map(Record::Chunk));
+        }
+
+        // For non-chunk records, read the full payload into a buffer
+        let mut data = vec![0u8; data_len as usize];
         if let Err(e) = self.reader.reader.read_exact(&mut data) {
+            self.failed = true;
             return Some(Err(e.into()));
         }
 
+        // Update offset
+        self.current_offset = match self.current_offset.checked_add(data_len) {
+            Some(offset) => offset,
+            None => {
+                self.failed = true;
+                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
+            }
+        };
+
         // Parse based on type
-        Some(parse_record(record_type, data))
-    }
-}
-
-/// Parses a record from its type byte and payload data
-fn parse_record(record_type: u8, data: Vec<u8>) -> Result<Record> {
-    match RecordType::from_byte(record_type) {
-        Some(RecordType::Header) => Ok(Record::Header(data.as_slice().try_into()?)),
-
-        Some(RecordType::Chunk) => Ok(Record::Chunk(data.as_slice().try_into()?)),
-
-        Some(RecordType::Manifest) => Ok(Record::Manifest(data.as_slice().try_into()?)),
-
-        // Future/unimplemented types
-        Some(_) => Ok(Record::Unknown { record_type, data }),
-
-        // Actually unknown
-        None => Ok(Record::Unknown { record_type, data }),
+        Some(Record::parse(record_type, &data))
     }
 }
 
@@ -147,136 +245,123 @@ mod tests {
     const MANIFEST_OFFSET: RangeInclusive<usize> = 0x138..=0x13b;
 
     #[test]
-    fn read_fixture_records() -> Result<()> {
+    fn read_minimal_fixture() -> Result<()> {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
 
-        for record in reader.records() {
-            match record? {
-                Record::Header(header) => {
-                    assert_eq!(
-                        header.version,
-                        u32::from_be_bytes(FIXTURE[HEADER_VERSION].try_into().unwrap())
-                    )
-                }
+        let records: Vec<_> = reader.records()?.collect::<Result<_>>()?;
+        assert_eq!(records.len(), 3);
 
-                // We only have one chunk, with one entry
-                Record::Chunk(chunk) => {
-                    assert_eq!(
-                        chunk.seqno,
-                        u64::from_be_bytes(FIXTURE[CHUNK_SEQ_NO].try_into().unwrap())
-                    );
-
-                    assert_eq!(chunk.format, ChunkFormat::Raw);
-
-                    assert_eq!(
-                        chunk.namespace,
-                        str::from_utf8(&FIXTURE[CHUNK_NAMESPACE]).unwrap()
-                    );
-
-                    assert_eq!(
-                        chunk.key_len,
-                        u32::from_be_bytes(FIXTURE[CHUNK_KEY_LEN].try_into().unwrap())
-                    );
-
-                    let footer_entry_count =
-                        u32::from_be_bytes(FIXTURE[CHUNK_ENTRY_COUNT].try_into().unwrap());
-
-                    assert_eq!(chunk.entries.len(), footer_entry_count as usize);
-
-                    let entry = chunk.entries.first().unwrap();
-                    assert_eq!(entry.key, FIXTURE[CHUNK_ENTRY_KEY]);
-                    assert_eq!(entry.value, FIXTURE[CHUNK_ENTRY_VALUE]);
-
-                    assert_eq!(chunk.footer.entries_count, footer_entry_count);
-
-                    assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
-                }
-
-                Record::Manifest(manifest) => {
-                    assert_eq!(
-                        manifest.slot_no,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_SLOT_NO].try_into().unwrap())
-                    );
-
-                    assert_eq!(
-                        manifest.total_entries,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_ENTRIES].try_into().unwrap())
-                    );
-
-                    assert_eq!(
-                        manifest.total_chunks,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_CHUNKS].try_into().unwrap())
-                    );
-
-                    assert_eq!(*manifest.root_hash.as_bytes(), FIXTURE[MANIFEST_ROOT_HASH]);
-
-                    assert_eq!(manifest.namespace_info.len(), 1);
-                    let ns_info = manifest.namespace_info.first().unwrap();
-
-                    assert_eq!(
-                        ns_info.entries_count,
-                        u64::from_be_bytes(
-                            FIXTURE[MANIFEST_NSINFO_ENTRIES_COUNT].try_into().unwrap()
-                        )
-                    );
-
-                    assert_eq!(
-                        ns_info.chunks_count,
-                        u64::from_be_bytes(
-                            FIXTURE[MANIFEST_NSINFO_CHUNKS_COUNT].try_into().unwrap()
-                        )
-                    );
-
-                    assert_eq!(
-                        ns_info.name,
-                        str::from_utf8(&FIXTURE[MANIFEST_NSINFO_NAME]).unwrap()
-                    );
-
-                    assert_eq!(*ns_info.digest.as_bytes(), FIXTURE[MANIFEST_NSINFO_DIGEST]);
-
-                    assert_eq!(
-                        manifest.prev_manifest,
-                        u64::from_be_bytes(FIXTURE[MANIFEST_PREV_MANIFEST].try_into().unwrap())
-                    );
-
-                    assert_eq!(
-                        manifest.summary.created_at,
-                        str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_CREATED_AT]).unwrap()
-                    );
-
-                    assert_eq!(
-                        manifest.summary.tool,
-                        str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_TOOL]).unwrap()
-                    );
-
-                    assert_eq!(manifest.summary.comment, None);
-
-                    assert_eq!(
-                        manifest.offset,
-                        u32::from_be_bytes(FIXTURE[MANIFEST_OFFSET].try_into().unwrap())
-                    );
-                }
-
-                Record::Unknown { record_type, .. } => {
-                    panic!("Unknown record type: 0x{:02x}", record_type)
-                }
-            }
+        // Test header
+        if let Record::Header(header) = &records[0] {
+            assert_eq!(
+                header.version,
+                u32::from_be_bytes(FIXTURE[HEADER_VERSION].try_into().unwrap())
+            )
+        } else {
+            panic!("Expected header");
         }
 
-        Ok(())
-    }
+        // Test chunk
+        if let Record::Chunk(chunk) = &records[1] {
+            assert_eq!(
+                chunk.seqno,
+                u64::from_be_bytes(FIXTURE[CHUNK_SEQ_NO].try_into().unwrap())
+            );
 
-    #[test]
-    fn fixture_has_expected_structure() -> Result<()> {
-        let scls = Cursor::new(FIXTURE);
-        let mut reader = SclsReader::new(scls);
-        let records: Vec<_> = reader.records().collect::<Result<_>>()?;
+            assert_eq!(chunk.format, ChunkFormat::Raw);
 
-        assert_eq!(records.len(), 3);
-        assert!(matches!(records[0], Record::Header(_)));
-        assert!(matches!(records[1], Record::Chunk(_)));
-        assert!(matches!(records[2], Record::Manifest(_)));
+            assert_eq!(
+                chunk.namespace,
+                str::from_utf8(&FIXTURE[CHUNK_NAMESPACE]).unwrap()
+            );
+
+            assert_eq!(
+                chunk.key_len,
+                u32::from_be_bytes(FIXTURE[CHUNK_KEY_LEN].try_into().unwrap())
+            );
+
+            let footer_entry_count =
+                u32::from_be_bytes(FIXTURE[CHUNK_ENTRY_COUNT].try_into().unwrap());
+
+            assert_eq!(chunk.footer.entries_count, footer_entry_count);
+
+            assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
+
+            let mut cursor = Cursor::new(FIXTURE);
+            let entries: Vec<_> = chunk.entries(&mut cursor)?.collect::<Result<_>>()?;
+            assert_eq!(entries.len(), 1);
+
+            let entry = entries.first().unwrap();
+            assert_eq!(entry.key, FIXTURE[CHUNK_ENTRY_KEY]);
+            assert_eq!(entry.value, FIXTURE[CHUNK_ENTRY_VALUE]);
+        } else {
+            panic!("Expected chunk");
+        }
+
+        // Test manifest
+        if let Record::Manifest(manifest) = &records[2] {
+            assert_eq!(
+                manifest.slot_no,
+                u64::from_be_bytes(FIXTURE[MANIFEST_SLOT_NO].try_into().unwrap())
+            );
+
+            assert_eq!(
+                manifest.total_entries,
+                u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_ENTRIES].try_into().unwrap())
+            );
+
+            assert_eq!(
+                manifest.total_chunks,
+                u64::from_be_bytes(FIXTURE[MANIFEST_TOTAL_CHUNKS].try_into().unwrap())
+            );
+
+            assert_eq!(*manifest.root_hash.as_bytes(), FIXTURE[MANIFEST_ROOT_HASH]);
+
+            assert_eq!(manifest.namespace_info.len(), 1);
+            let ns_info = manifest.namespace_info.first().unwrap();
+
+            assert_eq!(
+                ns_info.entries_count,
+                u64::from_be_bytes(FIXTURE[MANIFEST_NSINFO_ENTRIES_COUNT].try_into().unwrap())
+            );
+
+            assert_eq!(
+                ns_info.chunks_count,
+                u64::from_be_bytes(FIXTURE[MANIFEST_NSINFO_CHUNKS_COUNT].try_into().unwrap())
+            );
+
+            assert_eq!(
+                ns_info.name,
+                str::from_utf8(&FIXTURE[MANIFEST_NSINFO_NAME]).unwrap()
+            );
+
+            assert_eq!(*ns_info.digest.as_bytes(), FIXTURE[MANIFEST_NSINFO_DIGEST]);
+
+            assert_eq!(
+                manifest.prev_manifest,
+                u64::from_be_bytes(FIXTURE[MANIFEST_PREV_MANIFEST].try_into().unwrap())
+            );
+
+            assert_eq!(
+                manifest.summary.created_at,
+                str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_CREATED_AT]).unwrap()
+            );
+
+            assert_eq!(
+                manifest.summary.tool,
+                str::from_utf8(&FIXTURE[MANIFEST_SUMMARY_TOOL]).unwrap()
+            );
+
+            assert_eq!(manifest.summary.comment, None);
+
+            assert_eq!(
+                manifest.offset,
+                u32::from_be_bytes(FIXTURE[MANIFEST_OFFSET].try_into().unwrap())
+            );
+        } else {
+            panic!("Expected manifest");
+        }
 
         Ok(())
     }

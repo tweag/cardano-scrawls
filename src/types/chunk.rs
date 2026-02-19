@@ -1,6 +1,7 @@
 //! SCLS chunk records and entries.
 
-use std::str;
+use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 
 use crate::error::{Result, SclsError};
 use crate::types::Digest;
@@ -47,28 +48,6 @@ impl TryFrom<u8> for ChunkFormat {
     }
 }
 
-/// A chunk of entries with associated metadata and integrity information.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunk {
-    /// Sequential chunk number
-    pub seqno: u64,
-
-    /// Compression format
-    pub format: ChunkFormat,
-
-    /// Namespace these entries belong to
-    pub namespace: String,
-
-    /// Fixed key size for all entries in this chunk
-    pub key_len: u32,
-
-    /// The entries in this chunk
-    pub entries: Vec<Entry>,
-
-    /// Chunk footer with count and digest
-    pub footer: ChunkFooter,
-}
-
 /// A single key-value entry within a chunk
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -89,86 +68,161 @@ pub struct ChunkFooter {
     pub digest: Digest,
 }
 
-impl TryFrom<&[u8]> for Chunk {
-    type Error = SclsError;
+/// A handle to a chunk in the SCLS file.
+///
+/// Entry data is loaded lazily when calling [`entries`](ChunkHandle::entries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkHandle {
+    /// Sequential chunk number
+    pub seqno: u64,
 
-    /// Parses a chunk record from its payload.
+    /// Compression format
+    pub format: ChunkFormat,
+
+    /// Namespace these entries belong to
+    pub namespace: String,
+
+    /// Fixed key size for all entries in this chunk
+    pub key_len: u32,
+
+    /// Chunk footer with count and digest
+    pub footer: ChunkFooter,
+
+    /// Byte range where entry data is located
+    entries_range: Range<u64>,
+}
+
+impl ChunkHandle {
+    /// Returns an iterator that streams entries from the file on-demand.
+    ///
+    /// Each entry is read from disk as the iterator advances.
+    /// This requires mutable access to the reader.
+    ///
+    /// This method seeks the reader to the start of the entry data. The iterator will advance the
+    /// reader position as entries are consumed. The reader position after iteration is unspecified
+    /// and depends on where iteration stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if seeking to the entry data fails.
+    pub fn entries<'a, R: Read + Seek>(
+        &self,
+        reader: &'a mut R,
+    ) -> Result<StreamingEntryIter<'a, R>> {
+        reader.seek(SeekFrom::Start(self.entries_range.start))?;
+        Ok(StreamingEntryIter {
+            reader,
+            key_len: self.key_len,
+            remaining_bytes: self.entries_range.end - self.entries_range.start,
+            remaining_entries: self.footer.entries_count,
+        })
+    }
+
+    /// Parses a chunk record directly from a reader, achieving true lazy loading.
+    ///
+    /// This method reads only the chunk header and footer from the reader, calculating the byte
+    /// range where entries are located without ever loading entry data into memory.
+    ///
+    /// After this method returns, the reader position is unspecified (typically at the end of the
+    /// footer). Callers should seek to a known position if they need to continue reading.
+    ///
+    /// # Arguments
+    ///
+    /// - `reader`: A seekable reader positioned at the start of the chunk payload (after the
+    ///   record type byte)
+    /// - `payload_start_offset`: Absolute file offset where the chunk payload begins
+    /// - `payload_len`: Length of the chunk payload in bytes (excluding record type)
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The payload is too small (fewer than 49 bytes)
+    /// - Byte offsets overflow
     /// - The chunk format is not recognised
     /// - The namespace length overruns the payload
     /// - The namespace is not valid UTF-8
-    /// - The footer (32 bytes) overruns the payload
-    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
-        // Minimum size:
+    /// - I/O errors occur while reading
+    pub fn parse<R: Read + Seek>(
+        reader: &mut R,
+        payload_start_offset: u64,
+        payload_len: u32,
+    ) -> Result<Self> {
+        // Minimum payload size:
         // seqno(8) + format(1) + len_ns(4) + key_len(4) + entries_count(4) + digest(28) = 49 bytes
-        if value.len() < 49 {
+        if payload_len < 49 {
             return Err(SclsError::MalformedRecord(format!(
-                "chunk too short: {} bytes",
-                value.len()
+                "chunk payload too short: {} bytes",
+                payload_len
             )));
         }
 
-        let mut pos = 0;
+        // Read seqno (8 bytes)
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf)?;
+        let seqno = u64::from_be_bytes(buf);
 
-        // Parse seqno
-        let seqno = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        // Parse format
-        let format = ChunkFormat::from_byte(value[pos]).ok_or_else(|| {
-            SclsError::MalformedRecord(format!("invalid chunk format: 0x{:02x}", value[pos]))
+        // Read format (1 byte)
+        let mut format_buf = [0u8; 1];
+        reader.read_exact(&mut format_buf)?;
+        let format = ChunkFormat::from_byte(format_buf[0]).ok_or_else(|| {
+            SclsError::MalformedRecord(format!("invalid chunk format: 0x{:02x}", format_buf[0]))
         })?;
-        pos += 1;
 
-        // Parse namespace
-        let len_ns = u32::from_be_bytes(value[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
+        // Read namespace length (4 bytes)
+        let mut len_ns_buf = [0u8; 4];
+        reader.read_exact(&mut len_ns_buf)?;
+        let len_ns = u32::from_be_bytes(len_ns_buf);
 
-        let total_len = pos
+        // Header size so far: seqno(8) + format(1) + len_ns(4) = 13 bytes
+        // Plus namespace and key_len(4) and footer(32)
+        let header_fixed_size: u32 = 8 + 1 + 4 + 4; // 17 bytes without namespace
+        let footer_size: u32 = 32;
+
+        let min_size = header_fixed_size
             .checked_add(len_ns)
+            .and_then(|s| s.checked_add(footer_size))
             .ok_or_else(|| SclsError::MalformedRecord("namespace length overflow".into()))?;
 
-        if total_len > value.len() {
+        if payload_len < min_size {
             return Err(SclsError::MalformedRecord(
-                "namespace length extends beyond data".into(),
+                "chunk payload too short for namespace and footer".into(),
             ));
         }
 
-        let namespace = str::from_utf8(&value[pos..pos + len_ns])
-            .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace".into()))?
-            .to_string();
-        pos += len_ns;
+        // Read namespace
+        let mut ns_buf = vec![0u8; len_ns as usize];
+        reader.read_exact(&mut ns_buf)?;
+        let namespace = String::from_utf8(ns_buf)
+            .map_err(|_| SclsError::MalformedRecord("invalid UTF-8 in namespace".into()))?;
 
-        // Parse key length
-        let key_len = u32::from_be_bytes(value[pos..pos + 4].try_into().unwrap());
-        pos += 4;
+        // Read key_len (4 bytes)
+        let mut key_len_buf = [0u8; 4];
+        reader.read_exact(&mut key_len_buf)?;
+        let key_len = u32::from_be_bytes(key_len_buf);
 
-        // Footer is at the end: entries_count(4) + digest(28) = 32 bytes
-        let footer_size = 32;
-        let needed_len = pos
-            .checked_add(footer_size)
-            .ok_or_else(|| SclsError::MalformedRecord("footer length overflow".into()))?;
+        // Calculate header size: seqno(8) + format(1) + len_ns(4) + namespace + key_len(4)
+        let header_size = header_fixed_size + len_ns; // 17 + len_ns
 
-        if value.len() < needed_len {
-            return Err(SclsError::MalformedRecord(
-                "chunk too short for footer".into(),
-            ));
-        }
+        // Calculate entries range
+        // entries start right after header, end 32 bytes before payload end
+        let entries_start = payload_start_offset
+            .checked_add(header_size as u64)
+            .ok_or_else(|| SclsError::MalformedRecord("offset overflow".into()))?;
 
-        let footer_start = value.len() - footer_size;
-        let entries_data = &value[pos..footer_start];
+        let entries_end = payload_start_offset
+            .checked_add(payload_len as u64)
+            .and_then(|end| end.checked_sub(footer_size as u64))
+            .ok_or_else(|| SclsError::MalformedRecord("offset overflow".into()))?;
 
-        // Parse footer
-        let entries_count =
-            u32::from_be_bytes(value[footer_start..footer_start + 4].try_into().unwrap());
+        // Seek to footer and read it
+        let footer_offset = entries_end;
+        reader.seek(SeekFrom::Start(footer_offset))?;
 
-        let digest_bytes: [u8; 28] = value[footer_start + 4..footer_start + 32]
-            .try_into()
-            .unwrap();
+        let mut footer_buf = [0u8; 32];
+        reader.read_exact(&mut footer_buf)?;
+
+        let entries_count = u32::from_be_bytes(footer_buf[0..4].try_into().unwrap());
+        let digest_bytes: [u8; 28] = footer_buf[4..32].try_into().unwrap();
         let digest = digest_bytes.into();
 
         let footer = ChunkFooter {
@@ -176,102 +230,139 @@ impl TryFrom<&[u8]> for Chunk {
             digest,
         };
 
-        // Parse entries
-        let entries = parse_entries(entries_data, key_len)?;
-
-        // Verify count
-        // NOTE Count verification happens after parsing entries, so is susceptible to DoS attacks
-        if entries.len() as u32 != entries_count {
-            return Err(SclsError::MalformedRecord(format!(
-                "entry count mismatch: expected {}, found {}",
-                entries_count,
-                entries.len()
-            )));
-        }
-
-        Ok(Chunk {
+        Ok(ChunkHandle {
             seqno,
             format,
             namespace,
             key_len,
-            entries,
             footer,
+            entries_range: entries_start..entries_end,
         })
     }
 }
 
-/// Parse entries from a chunk's data blob.
+/// Iterator that streams entries from a file on-demand.
 ///
-/// Each entry consists of a 4-byte length prefix, a fixed-size key and a variable-size value.
-///
-/// # Note
-///
-/// This function currently allocates on an untrusted length input. It would make sense to put a
-/// configurable upper limit on this to prevent memory saturation.
-///
-/// See [issue #7](https://github.com/tweag/cardano-scrawls/issues/7).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - An entry's length prefix extends beyond the payload
-/// - An entry's body is shorter than the key length
-fn parse_entries(data: &[u8], key_len: u32) -> Result<Vec<Entry>> {
-    let mut entries = Vec::new();
-    let mut pos = 0;
+/// This iterator validates that the number of entries matches the footer's `entries_count` and
+/// that all entry bytes are consumed. It is error-fusing: after returning an error, all subsequent
+/// calls to `next()` return `None`.
+pub struct StreamingEntryIter<'a, R> {
+    reader: &'a mut R,
+    key_len: u32,
+    remaining_bytes: u64,
+    remaining_entries: u32,
+}
 
-    while pos < data.len() {
-        // Need at least 4 bytes for length prefix
-        let needed_len = pos
-            .checked_add(4)
-            .ok_or_else(|| SclsError::MalformedRecord("entry length overflow".into()))?;
+impl<R: Read> Iterator for StreamingEntryIter<'_, R> {
+    type Item = Result<Entry>;
 
-        if needed_len > data.len() {
-            return Err(SclsError::MalformedRecord(
-                "incomplete entry length prefix".into(),
-            ));
+    fn next(&mut self) -> Option<Self::Item> {
+        // Check if we've consumed all expected entries
+        if self.remaining_entries == 0 {
+            // Validate: no bytes should remain
+            if self.remaining_bytes > 0 {
+                let remaining = self.remaining_bytes;
+                self.remaining_bytes = 0;
+                return Some(Err(SclsError::MalformedRecord(format!(
+                    "entry count exhausted but {} bytes remain",
+                    remaining
+                ))));
+            }
+            return None;
         }
 
-        // Parse entry length
-        let len_body = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-
-        // Check we have enough data for the body
-        let needed_len = pos
-            .checked_add(len_body)
-            .ok_or_else(|| SclsError::MalformedRecord("entry body length overflow".into()))?;
-
-        if needed_len > data.len() {
-            return Err(SclsError::MalformedRecord(format!(
-                "entry body extends beyond data: need {} bytes, have {} bytes",
-                len_body,
-                data.len() - pos
-            )));
+        // Check if we've consumed all bytes
+        if self.remaining_bytes == 0 {
+            let remaining = self.remaining_entries;
+            self.remaining_entries = 0;
+            return Some(Err(SclsError::MalformedRecord(format!(
+                "entry data exhausted but {} entries expected",
+                remaining
+            ))));
         }
 
-        let key_len_usize = key_len as usize;
+        // Check we have enough bytes for the length prefix before reading
+        if self.remaining_bytes < 4 {
+            let remaining = self.remaining_bytes;
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
+            return Some(Err(SclsError::MalformedRecord(format!(
+                "incomplete entry length prefix: {} bytes remaining",
+                remaining
+            ))));
+        }
+
+        // Read 4 byte length prefix
+        let mut len_buf = [0u8; 4];
+        if let Err(e) = self.reader.read_exact(&mut len_buf) {
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
+            return Some(Err(e.into()));
+        }
+        let len_body = u32::from_be_bytes(len_buf) as usize;
+
+        // Check we're not reading beyond our range
+        let total_read = match 4u64.checked_add(len_body as u64) {
+            None => {
+                self.remaining_bytes = 0;
+                self.remaining_entries = 0;
+                return Some(Err(SclsError::MalformedRecord(
+                    "entry body length overflow".into(),
+                )));
+            }
+
+            Some(total_read) if total_read > self.remaining_bytes => {
+                self.remaining_bytes = 0;
+                self.remaining_entries = 0;
+                return Some(Err(SclsError::MalformedRecord(
+                    "entry extends beyond chunk data".into(),
+                )));
+            }
+
+            Some(total_read) => total_read,
+        };
+
+        let key_len_usize = self.key_len as usize;
 
         // Body must be at least as large as the key
         if len_body < key_len_usize {
-            return Err(SclsError::MalformedRecord(format!(
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
+            return Some(Err(SclsError::MalformedRecord(format!(
                 "entry body too short for key: body {} bytes, key {} bytes",
-                len_body, key_len
-            )));
+                len_body, self.key_len
+            ))));
         }
 
-        // Extract key and value
-        let key = data[pos..pos + key_len_usize].to_vec();
-        let value = data[pos + key_len_usize..pos + len_body].to_vec();
+        // Read the entry body: Key first
+        let mut key = vec![0u8; key_len_usize];
+        if let Err(e) = self.reader.read_exact(&mut key) {
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
+            return Some(Err(e.into()));
+        }
 
-        entries.push(Entry { key, value });
-        pos += len_body;
+        // Then the value
+        let value_len = len_body - key_len_usize; // Safe: already validated above
+        let mut value = vec![0u8; value_len];
+        if let Err(e) = self.reader.read_exact(&mut value) {
+            self.remaining_bytes = 0;
+            self.remaining_entries = 0;
+            return Some(Err(e.into()));
+        }
+
+        // Update counters only after successful read
+        self.remaining_bytes -= total_read;
+        self.remaining_entries -= 1;
+
+        Some(Ok(Entry { key, value }))
     }
-
-    Ok(entries)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -311,9 +402,20 @@ mod tests {
                 })
         ) {
             let (key_len, num_entries, data) = params;
-            let result = parse_entries(&data, key_len)?;
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
 
-            prop_assert_eq!(result.len(), num_entries);
+            let iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+                remaining_entries: num_entries as u32,
+            };
+
+            let result: Result<Vec<Entry>> = iter.collect();
+            let entries = result?;
+
+            prop_assert_eq!(entries.len(), num_entries);
         }
 
         #[test]
@@ -321,11 +423,22 @@ mod tests {
             params in (1u32..=64, 1usize..=10)
                 .prop_flat_map(|(key_len, num_entries)| {
                     entries_data(key_len, num_entries)
-                        .prop_map(move |data| (key_len, data))
+                        .prop_map(move |data| (key_len, num_entries, data))
                 })
         ) {
-            let (key_len, data) = params;
-            let entries = parse_entries(&data, key_len)?;
+            let (key_len, num_entries, data) = params;
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
+
+            let iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+                remaining_entries: num_entries as u32,
+            };
+
+            let result: Result<Vec<Entry>> = iter.collect();
+            let entries = result?;
 
             for entry in entries {
                 prop_assert_eq!(entry.key.len(), key_len as usize);
@@ -338,8 +451,20 @@ mod tests {
         ) {
             // Only 2 bytes instead of 4 for length prefix
             let data = vec![0x00, 0x01];
-            let result = parse_entries(&data, key_len);
-            prop_assert!(result.is_err());
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
+
+            let mut iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+                remaining_entries: 1,
+            };
+
+            // Try to read one entry, should fail
+            let result = iter.next();
+            prop_assert!(result.is_some());
+            prop_assert!(result.unwrap().is_err());
         }
 
         #[test]
@@ -350,8 +475,20 @@ mod tests {
             let mut data = 2u32.to_be_bytes().to_vec();
             data.extend_from_slice(&[0xff, 0xff]);
 
-            let result = parse_entries(&data, key_len);
-            prop_assert!(result.is_err());
+            let data_len = data.len() as u64;
+            let mut reader = Cursor::new(data);
+
+            let mut iter = StreamingEntryIter {
+                reader: &mut reader,
+                key_len,
+                remaining_bytes: data_len,
+                remaining_entries: 1,
+            };
+
+            // Try to read one entry, should fail
+            let result = iter.next();
+            prop_assert!(result.is_some());
+            prop_assert!(result.unwrap().is_err());
         }
     }
 }
