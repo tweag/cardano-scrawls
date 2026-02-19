@@ -4,8 +4,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use crate::error::{Result, SclsError};
-use crate::types::digest::HASH_SIZE;
 use crate::types::Digest;
+use crate::types::digest::HASH_SIZE;
 
 use blake2b_simd::Params;
 
