@@ -367,8 +367,11 @@ impl Chunk {
             remaining_entries -= 1;
             pos += total_read;
 
-            // Seek to next entry
-            reader.seek(SeekFrom::Start(pos))?;
+            // Seek to next entry, if necessary
+            let current_pos = reader.stream_position()?;
+            if current_pos != pos {
+                reader.seek(SeekFrom::Start(pos))?;
+            }
         }
 
         Ok(())
