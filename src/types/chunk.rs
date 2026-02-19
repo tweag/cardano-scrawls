@@ -70,20 +70,36 @@ impl Entry {
     ///
     /// # Errors
     ///
-    /// Returns an error on I/O failure
-    pub fn materialise<R: Read + Seek>(
-        reader: &mut R,
-        key_len: u64,
-        value_len: u64,
-    ) -> Result<Self> {
+    /// Returns an error if:
+    /// - Entry component size overflows
+    /// - Memory allocation errors
+    /// - I/O errors occur during reading
+    pub fn materialise<R: Read>(reader: &mut R, key_len: u64, value_len: u64) -> Result<Self> {
+        // Allocate the necessary space
+        let key_len = usize::try_from(key_len)
+            .map_err(|_| SclsError::MalformedRecord("entry key length overflow".into()))?;
+
+        let mut key = Vec::new();
+        key.try_reserve_exact(key_len).map_err(|_| {
+            SclsError::MalformedRecord("out of memory: cannot materialise entry key".into())
+        })?;
+        key.resize(key_len, 0u8);
+
+        let value_len = usize::try_from(value_len)
+            .map_err(|_| SclsError::MalformedRecord("entry value length overflow".into()))?;
+
+        let mut value = Vec::new();
+        value.try_reserve_exact(value_len).map_err(|_| {
+            SclsError::MalformedRecord("out of memory: cannot materialise entry value".into())
+        })?;
+        value.resize(value_len, 0u8);
+
         // Read the entry key
-        let mut key = vec![0u8; key_len as usize];
         if let Err(e) = reader.read_exact(&mut key) {
             return Err(e.into());
         }
 
         // Read the entry value
-        let mut value = vec![0u8; value_len as usize];
         if let Err(e) = reader.read_exact(&mut value) {
             return Err(e.into());
         }
