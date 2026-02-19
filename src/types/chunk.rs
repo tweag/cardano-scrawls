@@ -170,7 +170,7 @@ impl Chunk {
         let mut buf = [0u8; 8];
         reader.read_exact(&mut buf)?;
         let seqno = u64::from_be_bytes(buf);
-        /*value length*/
+
         // Read format (1 byte)
         let mut format_buf = [0u8; 1];
         reader.read_exact(&mut format_buf)?;
