@@ -395,14 +395,14 @@ impl Chunk {
     /// - Parsing or I/O failure
     /// - Digest mismatch
     pub fn verify<R: Read + Seek>(&self, reader: &mut R) -> Result<()> {
-        let mut entry_hashes: Vec<Digest> = Vec::with_capacity(self.footer.entries_count as usize);
+        let mut chunk_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
 
         self.for_each_entry(reader, |reader, key_len, value_len| {
-            let mut hash_state = Params::new().hash_length(HASH_SIZE).to_state();
+            let mut entry_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
 
             // Hash preamble
-            hash_state.update(&[0x01]);
-            hash_state.update(self.namespace.as_bytes());
+            entry_hash_state.update(&[0x01]);
+            entry_hash_state.update(self.namespace.as_bytes());
 
             // Entry hash
             let mut buffer = [0u8; BLOCK_SIZE];
@@ -413,32 +413,24 @@ impl Chunk {
                 let buf = &mut buffer[..to_read];
                 reader.read_exact(buf)?;
 
-                hash_state.update(buf);
+                entry_hash_state.update(buf);
 
                 remaining -= to_read as u64;
             }
 
             // It's safe to unwrap here because we know our hash is HASH_SIZE bytes long
-            let hash_bytes: [u8; HASH_SIZE] = hash_state.finalize().as_bytes().try_into().unwrap();
-            entry_hashes.push(Digest::from(hash_bytes));
+            let entry_hash: [u8; HASH_SIZE] =
+                entry_hash_state.finalize().as_bytes().try_into().unwrap();
+
+            // Update the chunk hash with the entry hash
+            chunk_hash_state.update(&entry_hash);
 
             Ok(())
         })?;
 
-        // Compute chunk hash from concatenated entry hashes
-        let entry_digests: Vec<u8> = entry_hashes
-            .iter()
-            .flat_map(|d| d.as_bytes().iter().copied())
-            .collect();
-
-        let chunk_hash: [u8; HASH_SIZE] = Params::new()
-            .hash_length(HASH_SIZE)
-            .to_state()
-            .update(&entry_digests)
-            .finalize()
-            .as_bytes()
-            .try_into()
-            .unwrap(); // Again, this is safe
+        // Again, this is safe to unwrap
+        let chunk_hash: [u8; HASH_SIZE] =
+            chunk_hash_state.finalize().as_bytes().try_into().unwrap();
 
         // Compare computed with expected chunk hashes
         let expected = self.footer.digest;
