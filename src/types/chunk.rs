@@ -406,7 +406,9 @@ impl Chunk {
 
             // Entry hash
             let mut buffer = [0u8; BLOCK_SIZE];
-            let mut remaining = key_len + value_len;
+            let mut remaining = key_len
+                .checked_add(value_len)
+                .ok_or_else(|| SclsError::MalformedRecord("entry length overflow".into()))?;
 
             while remaining > 0 {
                 let to_read = (remaining as usize).min(BLOCK_SIZE);
