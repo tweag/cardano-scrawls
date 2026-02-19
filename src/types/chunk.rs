@@ -48,7 +48,7 @@ impl TryFrom<u8> for ChunkFormat {
     }
 }
 
-/// A single key-value entry within a chunk
+/// A single key-value entry within a chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Fixed-size key (length determined by chunk's key_len)
@@ -68,11 +68,11 @@ pub struct ChunkFooter {
     pub digest: Digest,
 }
 
-/// A handle to a chunk in the SCLS file.
+/// A chunk record in the SCLS file.
 ///
-/// Entry data is loaded lazily when calling [`entries`](ChunkHandle::entries).
+/// Entry data is loaded lazily when calling [`entries`](Chunk::entries).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkHandle {
+pub struct Chunk {
     /// Sequential chunk number
     pub seqno: u64,
 
@@ -92,7 +92,7 @@ pub struct ChunkHandle {
     entries_range: Range<u64>,
 }
 
-impl ChunkHandle {
+impl Chunk {
     /// Iterates over the entries in this chunk, invoking the closure for each one.
     ///
     /// The reader is seeked to the start of each entry's key before the closure is called. The
@@ -101,7 +101,7 @@ impl ChunkHandle {
     /// position; it will be repositioned automatically before the next entry.
     ///
     /// This method performs a second pass over the chunk data and does not interfere with entry
-    /// iteration via [`ChunkHandle::entries`].
+    /// iteration via [`Chunk::entries`].
     ///
     /// # Errors
     ///
@@ -341,7 +341,7 @@ impl ChunkHandle {
             digest,
         };
 
-        Ok(ChunkHandle {
+        Ok(Chunk {
             seqno,
             format,
             namespace,

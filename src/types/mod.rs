@@ -4,7 +4,7 @@ pub mod header;
 pub mod manifest;
 
 use crate::error::SclsError;
-pub use chunk::{ChunkFooter, ChunkFormat, ChunkHandle, Entry, StreamingEntryIter};
+pub use chunk::{ChunkFooter, ChunkFormat, Chunk, Entry, StreamingEntryIter};
 pub use digest::Digest;
 pub use header::Header;
 pub use manifest::{Manifest, NamespaceInfo, Summary};
