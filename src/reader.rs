@@ -211,7 +211,7 @@ mod tests {
     use std::str;
 
     use crate::error::Result;
-    use crate::types::ChunkFormat;
+    use crate::types::{ChunkFormat, Entry};
 
     use super::{Record, SclsReader};
 
@@ -289,7 +289,13 @@ mod tests {
             assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
 
             let mut cursor = Cursor::new(FIXTURE);
-            let entries: Vec<_> = chunk.entries(&mut cursor)?.collect::<Result<_>>()?;
+            let mut entries: Vec<Entry> = Vec::with_capacity(chunk.footer.entries_count as usize);
+            chunk.for_each_entry(&mut cursor, |reader, key_len, val_len| {
+                let entry = Entry::materialise(reader, key_len, val_len)?;
+                entries.push(entry);
+                Ok(())
+            })?;
+
             assert_eq!(entries.len(), 1);
 
             let entry = entries.first().unwrap();
