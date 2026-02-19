@@ -4,6 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use crate::error::{Result, SclsError};
+use crate::types::digest::HASH_SIZE;
 use crate::types::Digest;
 
 /// Compression format for chunk data.
@@ -174,8 +175,8 @@ impl Chunk {
         payload_len: u32,
     ) -> Result<Self> {
         // Minimum payload size:
-        // seqno(8) + format(1) + len_ns(4) + key_len(4) + entries_count(4) + digest(28) = 49 bytes
-        if payload_len < 49 {
+        // seqno(8) + format(1) + len_ns(4) + key_len(4) + entries_count(4) + digest(HASH_SIZE) = 21 + HASH_SIZE bytes
+        if payload_len < 21 + HASH_SIZE as u32 {
             return Err(SclsError::MalformedRecord(format!(
                 "chunk payload too short: {} bytes",
                 payload_len
@@ -248,7 +249,7 @@ impl Chunk {
         reader.read_exact(&mut footer_buf)?;
 
         let entries_count = u32::from_be_bytes(footer_buf[0..4].try_into().unwrap());
-        let digest_bytes: [u8; 28] = footer_buf[4..32].try_into().unwrap();
+        let digest_bytes: [u8; HASH_SIZE] = footer_buf[4..32].try_into().unwrap();
         let digest = digest_bytes.into();
 
         let footer = ChunkFooter {
@@ -426,7 +427,7 @@ mod tests {
         payload.extend_from_slice(&key_len.to_be_bytes()); // key_len
         payload.extend_from_slice(&entry_data); // entries
         payload.extend_from_slice(&num_entries.to_be_bytes()); // footer: entries_count
-        payload.extend_from_slice(&[0u8; 28]); // footer: digest (placeholder)
+        payload.extend_from_slice(&[0u8; HASH_SIZE]); // footer: digest (placeholder)
 
         let payload_len = payload.len() as u32;
         let mut cursor = Cursor::new(payload);
