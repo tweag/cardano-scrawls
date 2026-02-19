@@ -2,18 +2,21 @@
 
 use std::fmt::Display;
 
-/// A 28-byte Blake2b-224 digest.
+/// Hash length, in bytes.
+pub const HASH_SIZE: usize = 28;
+
+/// A HASH_SIZE byte Blake2b digest.
 ///
 /// Used for entry digests, chunk hashes and Merkle tree roots in SCLS files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Digest([u8; 28]);
+pub struct Digest([u8; HASH_SIZE]);
 
 impl Digest {
     /// Size of the digest in bytes.
-    pub const SIZE: usize = 28;
+    pub const SIZE: usize = HASH_SIZE;
 
-    /// Creates a new digest from a 28-byte array.
-    pub const fn new(bytes: [u8; 28]) -> Self {
+    /// Creates a new digest from a HASH_SIZE byte array.
+    pub const fn new(bytes: [u8; HASH_SIZE]) -> Self {
         Self(bytes)
     }
 
@@ -33,8 +36,8 @@ impl Display for Digest {
     }
 }
 
-impl From<[u8; 28]> for Digest {
-    fn from(value: [u8; 28]) -> Self {
+impl From<[u8; HASH_SIZE]> for Digest {
+    fn from(value: [u8; HASH_SIZE]) -> Self {
         Self(value)
     }
 }
