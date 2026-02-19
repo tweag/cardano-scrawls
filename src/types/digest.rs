@@ -1,5 +1,7 @@
 //! Blake2b-224 digest type.
 
+use std::fmt::Display;
+
 /// A 28-byte Blake2b-224 digest.
 ///
 /// Used for entry digests, chunk hashes and Merkle tree roots in SCLS files.
@@ -18,6 +20,16 @@ impl Digest {
     /// Returns the digest as a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl Display for Digest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+
+        Ok(())
     }
 }
 

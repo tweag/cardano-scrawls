@@ -1,5 +1,7 @@
 //! Error types for SCLS parsing and validation.
 
+use crate::types::Digest;
+
 use thiserror::Error;
 
 /// Errors that can occur when reading or writing SCLS files.
@@ -20,6 +22,10 @@ pub enum SclsError {
     /// Malformed record structure
     #[error("malformed record: {0}")]
     MalformedRecord(String),
+
+    /// Digest mismatch
+    #[error("mismatching hash digests: expected {expected}, computed {computed}")]
+    DigestMismatch { expected: Digest, computed: Digest },
 
     /// Unknown record type encountered
     #[error("unknown record type: 0x{0:02x}")]
