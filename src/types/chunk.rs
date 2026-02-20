@@ -452,6 +452,7 @@ mod tests {
 
     use blake2b_simd::Params;
     use proptest::prelude::*;
+    use rand::prelude::*;
 
     use super::*;
 
@@ -579,7 +580,7 @@ mod tests {
                 namespace.as_bytes(),
                 num_entries as u32,
                 entry_data,
-                &chunk_hash
+                &chunk_hash,
             )
         }
     }
@@ -629,6 +630,72 @@ mod tests {
 
             let result = chunk.for_each_entry(&mut cursor, |_reader, _kl, _vl| Ok(()));
             prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn verify_valid_chunk_digests((chunk, mut cursor) in valid_chunks(0, 10)) {
+            let verified = chunk.verify(&mut cursor);
+            prop_assert!(verified.is_ok());
+        }
+
+        #[test]
+        fn catch_corrupted_digest_in_footer(params in chunk_params(0, 10)) {
+            let (key_len, namespace, num_entries, entry_data, chunk_hash) = params;
+
+            // Corrupt the chunk digest
+            let mut rng = rand::rng();
+            let mut corrupted_hash = chunk_hash;
+            let idx = rng.random_range(0..HASH_SIZE);
+            let mask = rng.random_range(1u8..=255);
+            corrupted_hash[idx] ^= mask;
+
+            let (chunk, mut cursor) = make_chunk(
+                key_len,
+                namespace.as_bytes(),
+                num_entries as u32,
+                entry_data,
+                &corrupted_hash,
+            );
+
+            let verified = chunk.verify(&mut cursor);
+            prop_assert!(verified.is_err());
+
+            if let Err(SclsError::DigestMismatch { expected, computed }) = verified {
+                prop_assert_eq!(expected.as_bytes(), corrupted_hash);
+                prop_assert_eq!(computed.as_bytes(), chunk_hash);
+            }
+        }
+
+        #[test]
+        fn catch_corrupted_entry(params in chunk_params(1, 10)) {
+            let (key_len, namespace, num_entries, entry_data, chunk_hash) = params;
+
+            // Corrupt the first entry data
+            let mut rng = rand::rng();
+            let mut corrupted_entries = entry_data.clone();
+            let first_entry_len = {
+                let bytes: [u8; 4] = corrupted_entries[..4].try_into().unwrap();
+                u32::from_be_bytes(bytes)
+            };
+            let idx = rng.random_range(4..4 + first_entry_len as usize);
+            let mask = rng.random_range(1u8..=255);
+            corrupted_entries[idx] ^= mask;
+
+            let (chunk, mut cursor) = make_chunk(
+                key_len,
+                namespace.as_bytes(),
+                num_entries as u32,
+                corrupted_entries,
+                &chunk_hash,
+            );
+
+            let verified = chunk.verify(&mut cursor);
+            prop_assert!(verified.is_err());
+
+            if let Err(SclsError::DigestMismatch { expected, computed }) = verified {
+                prop_assert_eq!(expected.as_bytes(), chunk_hash);
+                prop_assert_ne!(expected, computed);
+            }
         }
     }
 }
