@@ -450,12 +450,18 @@ impl Chunk {
 mod tests {
     use std::io::Cursor;
 
+    use blake2b_simd::Params;
     use proptest::prelude::*;
 
     use super::*;
 
-    // Strategy to generate a single serialised entry
-    fn entry_bytes(key_len: u32) -> impl Strategy<Value = Vec<u8>> {
+    const DUMMY_HASH: [u8; HASH_SIZE] = [0x00; HASH_SIZE];
+
+    // Strategy to generate a single serialised entry, with its computed digest
+    fn entry_bytes_with_digest(
+        key_len: u32,
+        namespace: String,
+    ) -> impl Strategy<Value = (Vec<u8>, [u8; HASH_SIZE])> {
         let key_len = key_len as usize;
 
         (
@@ -464,26 +470,84 @@ mod tests {
         )
             .prop_map(move |(key, value)| {
                 let body_len = (key.len() + value.len()) as u32;
-                let mut bytes = body_len.to_be_bytes().to_vec();
+                let mut entry_bytes = body_len.to_be_bytes().to_vec();
 
-                bytes.extend_from_slice(&key);
-                bytes.extend_from_slice(&value);
+                entry_bytes.extend_from_slice(&key);
+                entry_bytes.extend_from_slice(&value);
 
-                bytes
+                // Compute entry hash
+                let hash_bytes: [u8; HASH_SIZE] = Params::new()
+                    .hash_length(HASH_SIZE)
+                    .to_state()
+                    .update(&[0x01])
+                    .update(namespace.as_bytes())
+                    .update(&key)
+                    .update(&value)
+                    .finalize()
+                    .as_bytes()
+                    .try_into()
+                    .unwrap();
+
+                (entry_bytes, hash_bytes)
             })
     }
 
-    // Strategy to generate multiple entries
-    fn entries_data(key_len: u32, num_entries: usize) -> impl Strategy<Value = Vec<u8>> {
-        prop::collection::vec(entry_bytes(key_len), num_entries..=num_entries)
-            .prop_map(|entries| entries.concat())
+    // Strategy to generate multiple entries, with the computed chunk digest
+    fn entries_data_with_chunk_digest(
+        key_len: u32,
+        namespace: String,
+        num_entries: usize,
+    ) -> impl Strategy<Value = (Vec<u8>, [u8; HASH_SIZE])> {
+        prop::collection::vec(
+            entry_bytes_with_digest(key_len, namespace),
+            num_entries..=num_entries,
+        )
+        .prop_map(|entries| {
+            let mut hash_state = Params::new().hash_length(HASH_SIZE).to_state();
+            let mut all_bytes = Vec::new();
+
+            for (entry_bytes, entry_hash) in entries {
+                all_bytes.extend_from_slice(&entry_bytes);
+                hash_state.update(&entry_hash);
+            }
+
+            let chunk_hash: [u8; HASH_SIZE] = hash_state.finalize().as_bytes().try_into().unwrap();
+
+            (all_bytes, chunk_hash)
+        })
     }
 
-    // Build a minimal valid chunk payload wrapping `entry_data`, then parse it into a `Chunk`.
-    // The returned cursor is positioned at an unspecified location; `for_each_entry` will seek
-    // as needed.
-    fn make_chunk(key_len: u32, num_entries: u32, entry_data: Vec<u8>) -> (Chunk, Cursor<Vec<u8>>) {
-        let namespace = b"test";
+    // Strategy to generate all the necessary raw parameters for creating test chunks
+    // This is exposed as a primitive so we can mutate correct serialisations to elicit failures
+    prop_compose! {
+        fn chunk_params(min_entries: usize, max_entries: usize)
+            (key_len in 1u32..=64, namespace in ".+", num_entries in min_entries..=max_entries)
+            (
+                entry_data in entries_data_with_chunk_digest(
+                    key_len,
+                    namespace.clone(),
+                    num_entries
+                ),
+                key_len in Just(key_len),
+                namespace in Just(namespace),
+                num_entries in Just(num_entries),
+            )
+        -> (u32, String, usize, Vec<u8>, [u8; HASH_SIZE]) {
+            let (bytes, hash) = entry_data;
+            (key_len, namespace, num_entries, bytes, hash)
+        }
+    }
+
+    // Build a minimal valid chunk payload, with a correctly computed chunk digest, wrapping
+    // `entry_data`, then parse it into a `Chunk`. The returned cursor is positioned at an
+    // unspecified location; `for_each_entry` will seek as needed.
+    fn make_chunk(
+        key_len: u32,
+        namespace: &[u8],
+        num_entries: u32,
+        entry_data: Vec<u8>,
+        chunk_hash: &[u8; HASH_SIZE],
+    ) -> (Chunk, Cursor<Vec<u8>>) {
         let len_ns: u32 = namespace.len() as u32;
 
         let mut payload = Vec::new();
@@ -494,46 +558,46 @@ mod tests {
         payload.extend_from_slice(&key_len.to_be_bytes()); // key_len
         payload.extend_from_slice(&entry_data); // entries
         payload.extend_from_slice(&num_entries.to_be_bytes()); // footer: entries_count
-        payload.extend_from_slice(&[0u8; HASH_SIZE]); // footer: digest (placeholder)
+        payload.extend_from_slice(chunk_hash); // footer: chunk_hash
 
         let payload_len = payload.len() as u32;
         let mut cursor = Cursor::new(payload);
         let chunk = Chunk::parse(&mut cursor, 0, payload_len).unwrap();
+
         (chunk, cursor)
+    }
+
+    // Strategy for generating valid [`Chunk`]s with a cursor into their serialised form
+    prop_compose! {
+        fn valid_chunks(min_entries: usize, max_entries: usize)
+            (params in chunk_params(min_entries, max_entries))
+        -> (Chunk, Cursor<Vec<u8>>) {
+            let (key_len, namespace, num_entries, entry_data, chunk_hash) = params;
+
+            make_chunk(
+                key_len,
+                namespace.as_bytes(),
+                num_entries as u32,
+                entry_data,
+                &chunk_hash
+            )
+        }
     }
 
     proptest! {
         #[test]
-        fn parse_entries_count_matches(
-            params in (1u32..=64, 0usize..=10)
-                .prop_flat_map(|(key_len, num_entries)| {
-                    entries_data(key_len, num_entries)
-                        .prop_map(move |data| (key_len, num_entries, data))
-                })
-        ) {
-            let (key_len, num_entries, data) = params;
-            let (chunk, mut cursor) = make_chunk(key_len, num_entries as u32, data);
-
+        fn parse_entries_count_matches((chunk, mut cursor) in valid_chunks(0, 10)) {
             let mut count = 0usize;
             chunk.for_each_entry(&mut cursor, |_reader, _key_len, _val_len| {
                 count += 1;
                 Ok(())
             })?;
 
-            prop_assert_eq!(count, num_entries);
+            prop_assert_eq!(count, chunk.footer.entries_count as usize);
         }
 
         #[test]
-        fn parse_entries_keys_correct_length(
-            params in (1u32..=64, 1usize..=10)
-                .prop_flat_map(|(key_len, num_entries)| {
-                    entries_data(key_len, num_entries)
-                        .prop_map(move |data| (key_len, num_entries, data))
-                })
-        ) {
-            let (key_len, num_entries, data) = params;
-            let (chunk, mut cursor) = make_chunk(key_len, num_entries as u32, data);
-
+        fn parse_entries_keys_correct_length((chunk, mut cursor) in valid_chunks(1, 10)) {
             let mut entries: Vec<Entry> = Vec::new();
             chunk.for_each_entry(&mut cursor, |reader, kl, vl| {
                 entries.push(Entry::materialise(reader, kl, vl)?);
@@ -541,31 +605,27 @@ mod tests {
             })?;
 
             for entry in &entries {
-                prop_assert_eq!(entry.key.len(), key_len as usize);
+                prop_assert_eq!(entry.key.len(), chunk.key_len as usize);
             }
         }
 
         #[test]
-        fn parse_entries_rejects_truncated_length(
-            key_len in 1u32..=64,
-        ) {
+        fn parse_entries_rejects_truncated_length(key_len in 1u32..=64) {
             // Only 2 bytes instead of 4 for length prefix
             let data = vec![0x00, 0x01];
-            let (chunk, mut cursor) = make_chunk(key_len, 1, data);
+            let (chunk, mut cursor) = make_chunk(key_len, b"test", 1, data, &DUMMY_HASH);
 
             let result = chunk.for_each_entry(&mut cursor, |_reader, _kl, _vl| Ok(()));
             prop_assert!(result.is_err());
         }
 
         #[test]
-        fn parse_entries_rejects_body_too_short_for_key(
-            key_len in 4u32..=64,
-        ) {
+        fn parse_entries_rejects_body_too_short_for_key(key_len in 4u32..=64) {
             // Claim body is 2 bytes, but key_len is larger
             let mut data = 2u32.to_be_bytes().to_vec();
             data.extend_from_slice(&[0xff, 0xff]);
 
-            let (chunk, mut cursor) = make_chunk(key_len, 1, data);
+            let (chunk, mut cursor) = make_chunk(key_len, b"test", 1, data, &DUMMY_HASH);
 
             let result = chunk.for_each_entry(&mut cursor, |_reader, _kl, _vl| Ok(()));
             prop_assert!(result.is_err());
