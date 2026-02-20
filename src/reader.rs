@@ -288,6 +288,10 @@ mod tests {
 
             assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
 
+            // TODO Test chunk hash validity
+            // This currently cannot be done with our test fixture because the Haskell
+            // implementation is calculating the chunk hash differently than the CIP-0165 spec
+
             let mut cursor = Cursor::new(FIXTURE);
             let mut entries: Vec<Entry> = Vec::with_capacity(chunk.footer.entries_count as usize);
             chunk.for_each_entry(&mut cursor, |reader, key_len, val_len| {
