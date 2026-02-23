@@ -2,6 +2,7 @@ pub mod chunk;
 pub mod digest;
 pub mod header;
 pub mod manifest;
+pub mod merkle;
 
 use crate::error::SclsError;
 pub use chunk::{Chunk, ChunkFooter, ChunkFormat, Entry};

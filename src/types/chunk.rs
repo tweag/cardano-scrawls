@@ -6,6 +6,7 @@ use std::ops::Range;
 use crate::error::{Result, SclsError};
 use crate::types::Digest;
 use crate::types::digest::HASH_SIZE;
+use crate::types::merkle;
 
 use blake2b_simd::Params;
 
@@ -385,7 +386,7 @@ impl Chunk {
 
     /// Verify the chunk digest from the entry digests.
     ///
-    /// - Each entry's digest is computed as `H(0x01 || ns_str || key || value)`.
+    /// - Each entry's digest is computed as `H(merkle::LEAF_PREFIX || ns_str || key || value)`.
     /// - The chunk digest is computed as `H(concat(digest(e) for e in entries))`.
     /// - `H` is the hashing function; viz. Blake2b-224.
     ///
@@ -401,7 +402,7 @@ impl Chunk {
             let mut entry_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
 
             // Hash preamble
-            entry_hash_state.update(&[0x01]);
+            entry_hash_state.update(&[merkle::LEAF_PREFIX]);
             entry_hash_state.update(self.namespace.as_bytes());
 
             // Entry hash
@@ -480,7 +481,7 @@ mod tests {
                 let hash_bytes: [u8; HASH_SIZE] = Params::new()
                     .hash_length(HASH_SIZE)
                     .to_state()
-                    .update(&[0x01])
+                    .update(&[merkle::LEAF_PREFIX])
                     .update(namespace.as_bytes())
                     .update(&key)
                     .update(&value)
