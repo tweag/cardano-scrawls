@@ -132,12 +132,77 @@ impl Default for MerkleTree {
 mod tests {
     use super::*;
 
+    use hex::FromHex;
     use proptest::prelude::*;
+
+    /// Golden inputs and outputs
+    ///
+    /// These were generated with the `merkle-tree-incremental` Haskell library, per
+    /// https://github.com/tweag/cardano-cls at commit 98d912a, using the following method:
+    ///
+    /// ```haskell
+    /// import Crypto.Hash.Algorithms (Blake2b_224 (..))
+    /// import Crypto.Hash.MerkleTree.Incremental (add, empty, finalize, merkleRootHash)
+    /// import Data.ByteString (ByteString)
+    /// import qualified Data.ByteString.Char8 as BC
+    ///
+    /// leaf :: ByteString
+    /// leaf = BC.pack "Test"
+    ///
+    /// merkleRoot :: Int -> String
+    /// merkleRoot n =
+    ///   show $ merkleRootHash $ finalize $ foldl add (empty Blake2b_224) (replicate n leaf)
+    ///
+    /// main :: IO ()
+    /// main = mapM_ printRow [2, 3, 4, 5, 7]
+    ///   where
+    ///     printRow n = putStrLn $ show n ++ " " ++ merkleRoot n
+    /// ```
+    #[rustfmt::skip]
+    const GOLDEN: [(usize, &str); 5] = [
+        (2, "d3af86eb3e383618180e9e5e67b458f351335462871682ee332e20f8"),
+        (3, "37c91e733d32604abaf8ddff2b274f60e9b66a0311860ceddb5d43f4"),
+        (4, "e291561d5aa6555c44991f28f70dccb86352a4cd505b894a7bf85c4c"),
+        (5, "4aa703d6add1a49f1603328aa89db822122f174282c1637606c59f7c"),
+        (7, "ff159b2b1d0c703bf65bb0ae36dac26420cab122cc09df37c28df3a5"),
+    ];
 
     #[test]
     fn empty_merkle_tree() {
         let merkle = MerkleTree::new();
         assert_eq!(merkle.root(), *EMPTY);
+    }
+
+    #[test]
+    fn golden() {
+        let leaf = {
+            let hash = Params::new()
+                .hash_length(HASH_SIZE)
+                .to_state()
+                .update(&[LEAF_PREFIX])
+                .update(b"Test")
+                .finalize();
+
+            let bytes: [u8; HASH_SIZE] = hash.as_bytes().try_into().unwrap();
+            Digest::new(bytes)
+        };
+
+        for (leaves, golden_bytestring) in GOLDEN.iter() {
+            let computed_root = {
+                let mut merkle = MerkleTree::new();
+                for _ in 0..*leaves {
+                    merkle.add_leaf(leaf);
+                }
+                merkle.root()
+            };
+
+            let golden_root = {
+                let golden_bytes = <[u8; HASH_SIZE]>::from_hex(golden_bytestring).unwrap();
+                Digest::new(golden_bytes)
+            };
+
+            assert_eq!(computed_root, golden_root);
+        }
     }
 
     // Strategy for generating a range of leaves
