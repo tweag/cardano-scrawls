@@ -130,5 +130,85 @@ impl Default for MerkleTree {
 
 #[cfg(test)]
 mod tests {
-    // TODO
+    use super::*;
+
+    use proptest::prelude::*;
+
+    #[test]
+    fn empty_merkle_tree() {
+        let merkle = MerkleTree::new();
+        assert_eq!(merkle.root(), *EMPTY);
+    }
+
+    // Strategy for generating a range of leaves
+    prop_compose! {
+        fn range_of_leaves(min: usize, max: usize)
+            (leaf_bytes in prop::collection::vec(any::<[u8; HASH_SIZE]>(), min..=max))
+        -> Vec<Digest> {
+            leaf_bytes.into_iter().map(Digest::new).collect()
+        }
+    }
+
+    // Strategy for generating n leaves
+    fn n_leaves(count: usize) -> impl Strategy<Value = Vec<Digest>> {
+        range_of_leaves(count, count)
+    }
+
+    proptest! {
+        #[test]
+        fn single_leaf_is_root(leaves in n_leaves(1)) {
+            let mut merkle = MerkleTree::new();
+
+            let leaf = leaves[0];
+            merkle.add_leaf(leaf);
+
+            prop_assert_eq!(merkle.root(), leaf);
+        }
+
+        #[test]
+        fn deterministic_root(leaves in range_of_leaves(1, 16)) {
+            let mut merkle_1 = MerkleTree::new();
+            let mut merkle_2 = MerkleTree::new();
+
+            for leaf in leaves {
+                merkle_1.add_leaf(leaf);
+                merkle_2.add_leaf(leaf);
+            }
+
+            prop_assert_eq!(merkle_1.root(), merkle_2.root());
+        }
+
+        #[test]
+        fn non_commutativity(leaves in n_leaves(2)) {
+            prop_assume!(leaves[0] != leaves[1]);
+
+            let mut merkle_1 = MerkleTree::new();
+            merkle_1.add_leaf(leaves[0]);
+            merkle_1.add_leaf(leaves[1]);
+
+            let mut merkle_2 = MerkleTree::new();
+            merkle_2.add_leaf(leaves[1]);
+            merkle_2.add_leaf(leaves[0]);
+
+            prop_assert_ne!(merkle_1.root(), merkle_2.root());
+        }
+
+        #[test]
+        fn adding_leaf_changes_root(leaves in n_leaves(2)) {
+            let before = {
+                let mut merkle = MerkleTree::new();
+                merkle.add_leaf(leaves[0]);
+                merkle.root()
+            };
+
+            let after = {
+                let mut merkle = MerkleTree::new();
+                merkle.add_leaf(leaves[0]);
+                merkle.add_leaf(leaves[1]);
+                merkle.root()
+            };
+
+            prop_assert_ne!(before, after);
+        }
+    }
 }
