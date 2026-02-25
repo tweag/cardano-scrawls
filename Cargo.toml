@@ -10,6 +10,7 @@ keywords = ["cardano", "scls"]
 categories = ["cryptography::cryptocurrencies", "parsing"]
 
 [dependencies]
+blake2b_simd = "1.0.4"
 thiserror = "2.0.18"
 
 [dev-dependencies]

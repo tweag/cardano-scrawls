@@ -3,7 +3,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::types::{ChunkHandle, Header, Manifest, RecordType};
+use crate::types::{Chunk, Header, Manifest, RecordType};
 
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {
@@ -52,7 +52,7 @@ pub enum Record {
     Header(Header),
 
     /// Data chunk (with lazy loading)
-    Chunk(ChunkHandle),
+    Chunk(Chunk),
 
     /// Manifest
     Manifest(Manifest),
@@ -159,7 +159,7 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
 
             // Parse chunk directly from reader (reads only header + footer)
             let chunk_result =
-                ChunkHandle::parse(&mut self.reader.reader, payload_start, data_len as u32);
+                Chunk::parse(&mut self.reader.reader, payload_start, data_len as u32);
 
             // Update offset to end of record
             self.current_offset = match self.current_offset.checked_add(data_len) {
@@ -211,7 +211,7 @@ mod tests {
     use std::str;
 
     use crate::error::Result;
-    use crate::types::ChunkFormat;
+    use crate::types::{ChunkFormat, Entry};
 
     use super::{Record, SclsReader};
 
@@ -289,7 +289,13 @@ mod tests {
             assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
 
             let mut cursor = Cursor::new(FIXTURE);
-            let entries: Vec<_> = chunk.entries(&mut cursor)?.collect::<Result<_>>()?;
+            let mut entries: Vec<Entry> = Vec::with_capacity(chunk.footer.entries_count as usize);
+            chunk.for_each_entry(&mut cursor, |reader, key_len, val_len| {
+                let entry = Entry::materialise(reader, key_len, val_len)?;
+                entries.push(entry);
+                Ok(())
+            })?;
+
             assert_eq!(entries.len(), 1);
 
             let entry = entries.first().unwrap();
