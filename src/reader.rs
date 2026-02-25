@@ -216,6 +216,7 @@ mod tests {
     use super::{Record, SclsReader};
 
     /// Slurped in fixture generated from Haskell reference implementation:
+    ///
     /// ```sh
     /// scls-util debug generate minimal-raw.scls --namespace blocks/v0:1
     /// ```
@@ -245,7 +246,7 @@ mod tests {
     const MANIFEST_OFFSET: RangeInclusive<usize> = 0x138..=0x13b;
 
     #[test]
-    fn read_minimal_fixture() -> Result<()> {
+    fn minimal_fixture() -> Result<()> {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
 
