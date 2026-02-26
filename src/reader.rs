@@ -5,6 +5,54 @@ use std::io::{Read, Seek};
 use crate::error::{Result, SclsError};
 use crate::types::{Chunk, Header, Manifest, RecordType};
 
+/// Structural integrity check options.
+pub enum CheckStructure {
+    /// Do not verify structural integrity.
+    Disabled,
+
+    /// Verify that:
+    /// - the chunk sequence is strictly monotonically increasing;
+    /// - chunk namespaces are in bytewise ascending order.
+    Simple,
+
+    /// [Simple verification](CheckStructure::Simple), plus verify that:
+    /// - chunk keys are in lexicographically ascending order.
+    ///
+    /// Note: This requires key materialisation and, hence, more memory.
+    Full,
+}
+
+/// SCLS file verification options
+pub struct VerifyOptions {
+    /// Check structural integrity
+    pub check_structure: CheckStructure,
+
+    /// Check that all digests are valid. That is:
+    /// - Chunk digests
+    /// - Namespace Merkle root digests
+    /// - The global Merkle root digest
+    pub check_integrity: bool,
+}
+
+impl VerifyOptions {
+    /// Full verification.
+    pub fn full() -> Self {
+        Self {
+            check_structure: CheckStructure::Full,
+            check_integrity: true,
+        }
+    }
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            check_structure: CheckStructure::Simple,
+            check_integrity: true,
+        }
+    }
+}
+
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {
     reader: R,

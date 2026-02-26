@@ -35,7 +35,9 @@ pub enum SclsError {
 
     /// Structural: Entry keys not in lexicographically ascending order
     ///
-    /// Note: This check is not performed by default to avoid materialisation; see TODO
+    /// Note: This check is not performed by default to avoid materialisation; see
+    /// [`CheckStructure`](crate::reader::CheckStructure) and
+    /// [`VerifyOptions::default`](crate::reader::VerifyOptions::default).
     #[error(
         "chunk {seqno} does not have entry keys in lexicographically ascending order over namespace {namespace}"
     )]
