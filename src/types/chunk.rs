@@ -440,7 +440,12 @@ impl Chunk {
         let computed = Digest::from(chunk_hash);
 
         if expected != computed {
-            return Err(SclsError::DigestMismatch { expected, computed });
+            let seqno = self.seqno;
+            return Err(SclsError::ChunkDigestMismatch {
+                seqno,
+                expected,
+                computed,
+            });
         }
 
         Ok(())
@@ -661,7 +666,7 @@ mod tests {
             let verified = chunk.verify(&mut cursor);
             prop_assert!(verified.is_err());
 
-            if let Err(SclsError::DigestMismatch { expected, computed }) = verified {
+            if let Err(SclsError::ChunkDigestMismatch { expected, computed, .. }) = verified {
                 prop_assert_eq!(expected.as_bytes(), corrupted_hash);
                 prop_assert_eq!(computed.as_bytes(), chunk_hash);
             }
@@ -693,7 +698,7 @@ mod tests {
             let verified = chunk.verify(&mut cursor);
             prop_assert!(verified.is_err());
 
-            if let Err(SclsError::DigestMismatch { expected, computed }) = verified {
+            if let Err(SclsError::ChunkDigestMismatch { expected, computed, .. }) = verified {
                 prop_assert_eq!(expected.as_bytes(), chunk_hash);
                 prop_assert_ne!(expected, computed);
             }
