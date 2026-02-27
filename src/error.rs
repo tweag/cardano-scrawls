@@ -50,6 +50,22 @@ pub enum SclsError {
         in_manifest: Vec<String>,
     },
 
+    /// Structural: Manifest namespace chunk counts differ
+    #[error("mismatching chunk counts for {namespace}: expected {expected}, found {found}")]
+    NamespaceChunkMismatch {
+        namespace: String,
+        expected: u64,
+        found: u64,
+    },
+
+    /// Structural: Manifest namespace entry counts differ
+    #[error("mismatching entry counts for {namespace}: expected {expected}, found {found}")]
+    NamespaceEntryMismatch {
+        namespace: String,
+        expected: u64,
+        found: u64,
+    },
+
     /// Integrity: Chunk digest mismatch
     #[error("mismatching digest in chunk {seqno}: expected {expected}, computed {computed}")]
     ChunkDigestMismatch {
