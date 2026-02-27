@@ -386,6 +386,23 @@ impl Chunk {
 
     /// Verify the chunk digest from the entry digests.
     ///
+    /// Convenience wrapper around [`Chunk::verify_and`], with a noop closure.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Parsing or I/O failure
+    /// - Digest mismatch
+    pub fn verify<R: Read + Seek>(&self, reader: &mut R) -> Result<()> {
+        self.verify_and(reader, |_, _, _, _| Ok(()))
+    }
+
+    /// Verify the chunk digest from the entry digests, invoking the closure for each entry.
+    ///
+    /// The reader is seeked to the start of each entry's key before the closure is called. The
+    /// closure receives the entry's computed digest, the reader, the key length, and the value
+    /// length in bytes. The value immediately follows the key in the stream. The closure may leave
+    /// the reader at any position; it will be repositioned automatically before the next entry.
+    ///
     /// - Each entry's digest is computed as `H(merkle::LEAF_PREFIX || ns_str || key || value)`.
     /// - The chunk digest is computed as `H(concat(digest(e) for e in entries))`.
     /// - `H` is the hashing function; viz. Blake2b-224.
@@ -395,10 +412,20 @@ impl Chunk {
     /// Returns an error if:
     /// - Parsing or I/O failure
     /// - Digest mismatch
-    pub fn verify<R: Read + Seek>(&self, reader: &mut R) -> Result<()> {
+    pub fn verify_and<R, F>(&self, reader: &mut R, mut f: F) -> Result<()>
+    where
+        R: Read + Seek,
+        F: FnMut(
+            Digest, // entry digest
+            &mut R, // reader
+            u64,    // key length
+            u64,    // value length
+        ) -> Result<()>,
+    {
         let mut chunk_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
 
         self.for_each_entry(reader, |reader, key_len, value_len| {
+            let pos = reader.stream_position()?;
             let mut entry_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
 
             // Hash preamble
@@ -428,7 +455,9 @@ impl Chunk {
             // Update the chunk hash with the entry hash
             chunk_hash_state.update(&entry_hash);
 
-            Ok(())
+            // Invoke the closure
+            reader.seek(SeekFrom::Start(pos))?;
+            f(Digest::new(entry_hash), reader, key_len, value_len)
         })?;
 
         // Again, this is safe to unwrap
@@ -440,7 +469,11 @@ impl Chunk {
         let computed = Digest::from(chunk_hash);
 
         if expected != computed {
-            return Err(SclsError::DigestMismatch { expected, computed });
+            return Err(SclsError::ChunkDigestMismatch {
+                seqno: self.seqno,
+                expected,
+                computed,
+            });
         }
 
         Ok(())
@@ -661,7 +694,7 @@ mod tests {
             let verified = chunk.verify(&mut cursor);
             prop_assert!(verified.is_err());
 
-            if let Err(SclsError::DigestMismatch { expected, computed }) = verified {
+            if let Err(SclsError::ChunkDigestMismatch { expected, computed, .. }) = verified {
                 prop_assert_eq!(expected.as_bytes(), corrupted_hash);
                 prop_assert_eq!(computed.as_bytes(), chunk_hash);
             }
@@ -693,7 +726,7 @@ mod tests {
             let verified = chunk.verify(&mut cursor);
             prop_assert!(verified.is_err());
 
-            if let Err(SclsError::DigestMismatch { expected, computed }) = verified {
+            if let Err(SclsError::ChunkDigestMismatch { expected, computed, .. }) = verified {
                 prop_assert_eq!(expected.as_bytes(), chunk_hash);
                 prop_assert_ne!(expected, computed);
             }

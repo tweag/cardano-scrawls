@@ -1,9 +1,72 @@
 //! SCLS file reader and record parsing.
 
+use std::collections::{BTreeMap, BTreeSet}; // To maintain key order
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::types::{Chunk, Header, Manifest, RecordType};
+use crate::types::digest::HASH_SIZE;
+use crate::types::merkle::LEAF_PREFIX;
+use crate::types::{Chunk, Digest, Header, Manifest, MerkleTree, RecordType};
+
+use blake2b_simd::Params;
+
+/// Structural integrity check options.
+#[derive(Debug, Eq, PartialEq)]
+pub enum CheckStructure {
+    /// Do not verify structural integrity.
+    Disabled,
+
+    /// Verify that:
+    /// - the chunk sequence is strictly monotonically increasing;
+    /// - chunk namespaces are in bytewise ascending order;
+    /// - manifest chunk and entry counts are correct for each namespace.
+    Simple,
+
+    /// [Simple verification](CheckStructure::Simple), plus verify that:
+    /// - chunk keys are in lexicographically ascending order.
+    ///
+    /// Note: This requires key materialisation and, hence, more memory.
+    Full,
+}
+
+impl CheckStructure {
+    /// Whether structural integrity verification is enabled.
+    pub fn enabled(&self) -> bool {
+        self != &CheckStructure::Disabled
+    }
+}
+
+/// SCLS file verification options
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifyOptions {
+    /// Check structural integrity
+    pub check_structure: CheckStructure,
+
+    /// Check that all digests are valid. That is:
+    /// - Chunk digests
+    /// - Namespace Merkle root digests
+    /// - The global Merkle root digest
+    pub check_integrity: bool,
+}
+
+impl VerifyOptions {
+    /// Full verification.
+    pub fn full() -> Self {
+        Self {
+            check_structure: CheckStructure::Full,
+            check_integrity: true,
+        }
+    }
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            check_structure: CheckStructure::Simple,
+            check_integrity: true,
+        }
+    }
+}
 
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {
@@ -35,6 +98,162 @@ impl<R: Read + Seek> SclsReader<R> {
             current_offset,
             failed: false,
         })
+    }
+
+    /// Verify the SCLS file with the given options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - TODO
+    pub fn verify(&mut self, options: VerifyOptions) -> Result<()> {
+        if !options.check_structure.enabled() && !options.check_integrity {
+            // This is vacuous, but technically allowed
+            return Ok(());
+        }
+
+        let mut last_chunk_seqno: Option<u64> = None;
+        let mut last_chunk_namespace: Option<String> = None;
+        let mut last_ns_entry_key: Option<Vec<u8>> = None;
+        let mut ns_chunks: BTreeMap<String, u64> = BTreeMap::new();
+        let mut ns_entries: BTreeMap<String, u64> = BTreeMap::new();
+        let mut ns_digests: BTreeMap<String, MerkleTree> = BTreeMap::new();
+
+        // TODO
+        // - [x] Iterate through records
+        // - [ ] For chunks:
+        //   - [ ] Update the current seqno and namespace
+        //     - if CheckStructure::Simple
+        //       - [ ] Check monotonicity of seqno and namespace
+        //     - if namespace has changed and CheckStructure::Full
+        //       - [ ] reset last_namespace_key
+        //   - if check_integrity:
+        //     - [ ] Verify the chunk
+        //   - if CheckStructure::Full
+        //     - [ ] Iterate through entries and update last namespace key
+        //     - [ ] Check monotonicity
+        //   - [ ] Add entry digest to namespace Merkle tree
+        // - [x] For manifest
+        //   - [x] Namespace sets are the same
+        //   - if CheckStructure::Simple
+        //     - [x] Namespace chunk count matches
+        //     - [x] Namespace entry count matches
+        //   - if check_integrity
+        //     - [x] Check namespace Merkle roots
+        //     - [x] Construct global Merkle tree from namespace roots in ascending order by namespace, prepended with 0x01
+        //     - [x] Check global Merkle root
+
+        for record in self.records()? {
+            match record? {
+                Record::Chunk(chunk) => {
+                    todo!();
+                }
+
+                Record::Manifest(manifest) => {
+                    // Convert manifest namespace info vector into an ordered map of chunk count,
+                    // entry count and digest tuples. A BTree map is used to ensure entries are
+                    // ordered by namespace.
+                    let ns_info: BTreeMap<String, (u64, u64, Digest)> = manifest
+                        .namespace_info
+                        .iter()
+                        .map(|ns_info| {
+                            (
+                                ns_info.name.clone(),
+                                (ns_info.chunks_count, ns_info.entries_count, ns_info.digest),
+                            )
+                        })
+                        .collect();
+
+                    // Chunk namespaces must match manifest namespaces
+                    let chunk_namespaces: BTreeSet<&String> = ns_chunks.keys().collect();
+                    let manifest_namespaces: BTreeSet<&String> = ns_info.keys().collect();
+
+                    if chunk_namespaces != manifest_namespaces {
+                        // Only clone when necessary, for the error
+                        let in_chunks: Vec<String> =
+                            chunk_namespaces.into_iter().cloned().collect();
+                        let in_manifest: Vec<String> =
+                            manifest_namespaces.into_iter().cloned().collect();
+
+                        return Err(SclsError::NamespaceMismatch {
+                            in_chunks,
+                            in_manifest,
+                        });
+                    }
+
+                    // Check structure
+                    if options.check_structure.enabled() {
+                        for (namespace, (chunk_count, entry_count, _)) in &ns_info {
+                            // Namespace chunk counts must match those in the manifest
+                            let expected = *chunk_count;
+                            let found = ns_chunks[namespace];
+                            if expected != found {
+                                return Err(SclsError::NamespaceChunkMismatch {
+                                    namespace: namespace.to_string(),
+                                    expected,
+                                    found,
+                                });
+                            }
+
+                            // Namespace entry counts must match those in the manifest
+                            let expected = *entry_count;
+                            let found = ns_entries[namespace];
+                            if expected != found {
+                                return Err(SclsError::NamespaceEntryMismatch {
+                                    namespace: namespace.to_string(),
+                                    expected,
+                                    found,
+                                });
+                            }
+                        }
+                    }
+
+                    // Check integrity
+                    if options.check_integrity {
+                        let mut global_merkle: MerkleTree = MerkleTree::new();
+
+                        // Namespaces will be iterated through in order by virtue of the BTree map,
+                        // so the global Merkle tree's order will be correct
+                        for (namespace, (_, _, digest)) in &ns_info {
+                            // Check namespace root digests match computed
+                            let expected = *digest;
+                            let computed = ns_digests.remove(namespace).unwrap().root();
+                            if expected != computed {
+                                return Err(SclsError::NamespaceDigestMismatch {
+                                    namespace: namespace.to_string(),
+                                    expected,
+                                    computed,
+                                });
+                            }
+
+                            // Update the global Merkle tree
+                            let ns_hash = Params::new()
+                                .hash_length(HASH_SIZE)
+                                .to_state()
+                                .update(&[LEAF_PREFIX])
+                                .update(expected.as_bytes())
+                                .finalize();
+
+                            let ns_hash_bytes: [u8; HASH_SIZE] =
+                                ns_hash.as_bytes().try_into().unwrap();
+
+                            global_merkle.add_leaf(Digest::new(ns_hash_bytes));
+                        }
+
+                        // Check the global Merkle root matches
+                        let expected = manifest.root_hash;
+                        let computed = global_merkle.root();
+                        if expected != computed {
+                            return Err(SclsError::GlobalDigestMismatch { expected, computed });
+                        }
+                    }
+                }
+
+                _ => {}
+            };
+        }
+
+        Ok(())
     }
 }
 
