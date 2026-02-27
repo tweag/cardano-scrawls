@@ -1,9 +1,10 @@
 //! SCLS file reader and record parsing.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::types::{Chunk, Header, Manifest, RecordType};
+use crate::types::{Chunk, Header, Manifest, MerkleTree, RecordType};
 
 /// Structural integrity check options.
 pub enum CheckStructure {
@@ -83,6 +84,16 @@ impl<R: Read + Seek> SclsReader<R> {
             current_offset,
             failed: false,
         })
+    }
+
+    /// Verify the SCLS file with the given options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - TODO
+    pub fn verify(&mut self, options: VerifyOptions) -> Result<()> {
+        todo!();
     }
 }
 
