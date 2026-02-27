@@ -4,9 +4,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use crate::error::{Result, SclsError};
-use crate::types::Digest;
 use crate::types::digest::HASH_SIZE;
 use crate::types::merkle;
+use crate::types::Digest;
 
 use blake2b_simd::Params;
 
@@ -386,6 +386,23 @@ impl Chunk {
 
     /// Verify the chunk digest from the entry digests.
     ///
+    /// Convenience wrapper around [`Chunk::verify_and`], with a noop closure.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Parsing or I/O failure
+    /// - Digest mismatch
+    pub fn verify<R: Read + Seek>(&self, reader: &mut R) -> Result<()> {
+        self.verify_and(reader, |_, _, _, _| Ok(()))
+    }
+
+    /// Verify the chunk digest from the entry digests, invoking the closure for each entry.
+    ///
+    /// The reader is seeked to the start of each entry's key before the closure is called. The
+    /// closure receives the entry's computed digest, the reader, the key length, and the value
+    /// length in bytes. The value immediately follows the key in the stream. The closure may leave
+    /// the reader at any position; it will be repositioned automatically before the next entry.
+    ///
     /// - Each entry's digest is computed as `H(merkle::LEAF_PREFIX || ns_str || key || value)`.
     /// - The chunk digest is computed as `H(concat(digest(e) for e in entries))`.
     /// - `H` is the hashing function; viz. Blake2b-224.
@@ -395,10 +412,20 @@ impl Chunk {
     /// Returns an error if:
     /// - Parsing or I/O failure
     /// - Digest mismatch
-    pub fn verify<R: Read + Seek>(&self, reader: &mut R) -> Result<()> {
+    pub fn verify_and<R, F>(&self, reader: &mut R, mut f: F) -> Result<()>
+    where
+        R: Read + Seek,
+        F: FnMut(
+            Digest, // entry digest
+            &mut R, // reader
+            u64,    // key length
+            u64,    // value length
+        ) -> Result<()>,
+    {
         let mut chunk_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
 
         self.for_each_entry(reader, |reader, key_len, value_len| {
+            let pos = reader.stream_position()?;
             let mut entry_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
 
             // Hash preamble
@@ -428,7 +455,9 @@ impl Chunk {
             // Update the chunk hash with the entry hash
             chunk_hash_state.update(&entry_hash);
 
-            Ok(())
+            // Invoke the closure
+            reader.seek(SeekFrom::Start(pos))?;
+            f(Digest::new(entry_hash), reader, key_len, value_len)
         })?;
 
         // Again, this is safe to unwrap
@@ -440,9 +469,8 @@ impl Chunk {
         let computed = Digest::from(chunk_hash);
 
         if expected != computed {
-            let seqno = self.seqno;
             return Err(SclsError::ChunkDigestMismatch {
-                seqno,
+                seqno: self.seqno,
                 expected,
                 computed,
             });
