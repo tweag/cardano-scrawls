@@ -43,6 +43,13 @@ pub enum SclsError {
     )]
     KeysDisordered { namespace: String, seqno: u64 },
 
+    /// Structural: Manifest namespace set differs from chunk namespaces
+    #[error("mismatching namespace sets: in chunks {in_chunks:?}, in manifest {in_manifest:?}")]
+    NamespaceMismatch {
+        in_chunks: Vec<String>,
+        in_manifest: Vec<String>,
+    },
+
     /// Integrity: Chunk digest mismatch
     #[error("mismatching digest in chunk {seqno}: expected {expected}, computed {computed}")]
     ChunkDigestMismatch {
