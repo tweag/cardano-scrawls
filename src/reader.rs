@@ -216,6 +216,7 @@ mod tests {
     use super::{Record, SclsReader};
 
     /// Slurped in fixture generated from Haskell reference implementation:
+    ///
     /// ```sh
     /// scls-util debug generate minimal-raw.scls --namespace blocks/v0:1
     /// ```
@@ -245,7 +246,7 @@ mod tests {
     const MANIFEST_OFFSET: RangeInclusive<usize> = 0x138..=0x13b;
 
     #[test]
-    fn read_minimal_fixture() -> Result<()> {
+    fn minimal_fixture() -> Result<()> {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
 
@@ -288,9 +289,8 @@ mod tests {
 
             assert_eq!(*chunk.footer.digest.as_bytes(), FIXTURE[CHUNK_DIGEST]);
 
-            // TODO Test chunk hash validity
-            // This currently cannot be done with our test fixture because the Haskell
-            // implementation is calculating the chunk hash differently than the CIP-0165 spec
+            let mut cursor = Cursor::new(FIXTURE);
+            chunk.verify(&mut cursor)?;
 
             let mut cursor = Cursor::new(FIXTURE);
             let mut entries: Vec<Entry> = Vec::with_capacity(chunk.footer.entries_count as usize);
