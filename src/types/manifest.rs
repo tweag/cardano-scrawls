@@ -3,7 +3,7 @@
 use std::str;
 
 use crate::error::{Result, SclsError};
-use crate::types::Digest;
+use crate::types::digest::{Digest, HASH_SIZE};
 
 /// The manifest record (record type 0x01) containing file metadata and integrity information.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +76,8 @@ impl NamespaceInfo {
                 break;
             }
 
-            // Parse ns_info: entries_count(8) + chunks_count(8) + name(len_ns) + digest(28)
-            let required = 8 + 8 + len_ns + 28;
+            // Parse ns_info: entries_count(8) + chunks_count(8) + name(len_ns) + digest(HASH_SIZE)
+            let required = 8 + 8 + len_ns + HASH_SIZE;
             let min_len = pos
                 .checked_add(required)
                 .ok_or_else(|| SclsError::MalformedRecord("ns_info length overflow".into()))?;
@@ -99,9 +99,9 @@ impl NamespaceInfo {
                 .to_string();
             pos += len_ns;
 
-            let digest_bytes: [u8; 28] = data[pos..pos + 28].try_into().unwrap();
+            let digest_bytes: [u8; HASH_SIZE] = data[pos..pos + HASH_SIZE].try_into().unwrap();
             let digest = digest_bytes.into();
-            pos += 28;
+            pos += HASH_SIZE;
 
             namespaces.push(Self {
                 entries_count,
@@ -212,9 +212,9 @@ impl TryFrom<&[u8]> for Manifest {
         let prev_manifest = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let root_hash_bytes: [u8; 28] = value[pos..pos + 28].try_into().unwrap();
+        let root_hash_bytes: [u8; HASH_SIZE] = value[pos..pos + HASH_SIZE].try_into().unwrap();
         let root_hash = root_hash_bytes.into();
-        pos += 28;
+        pos += HASH_SIZE;
 
         let offset = u32::from_be_bytes(value[pos..pos + 4].try_into().unwrap());
         pos += 4;
