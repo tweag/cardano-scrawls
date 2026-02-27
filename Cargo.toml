@@ -14,5 +14,6 @@ blake2b_simd = "1.0.4"
 thiserror = "2.0.18"
 
 [dev-dependencies]
+hex = "0.4.3"
 proptest = "1.10.0"
 rand = "0.10.0"
