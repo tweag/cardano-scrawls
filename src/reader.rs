@@ -122,11 +122,11 @@ impl<R: Read + Seek> SclsReader<R> {
         // TODO
         // - [x] Iterate through records
         // - [ ] For chunks:
-        //   - [ ] Update the current seqno and namespace
+        //   - [x] Update the current seqno and namespace
         //     - if CheckStructure::Simple
-        //       - [ ] Check monotonicity of seqno and namespace
+        //       - [x] Check monotonicity of seqno and namespace
         //     - if namespace has changed and CheckStructure::Full
-        //       - [ ] reset last_namespace_key
+        //       - [x] reset last_namespace_key
         //   - if check_integrity:
         //     - [ ] Verify the chunk
         //   - if CheckStructure::Full
@@ -146,7 +146,41 @@ impl<R: Read + Seek> SclsReader<R> {
         for record in self.records()? {
             match record? {
                 Record::Chunk(chunk) => {
-                    todo!();
+                    if options.check_structure.enabled() {
+                        // Check strict monotonicity of chunk sequence number
+                        if let Some(previous) = last_chunk_seqno
+                            && previous >= chunk.seqno
+                        {
+                            return Err(SclsError::SeqnoDisordered {
+                                previous,
+                                found: chunk.seqno,
+                            });
+                        }
+
+                        if let Some(previous) = last_chunk_namespace {
+                            // Check monotonicity of chunk namespace
+                            if previous > chunk.namespace {
+                                return Err(SclsError::NamespaceDisordered {
+                                    previous,
+                                    found: chunk.namespace,
+                                });
+                            }
+
+                            // Reset last namespace's last entry key if the namespaces changes
+                            // during a full check
+                            if options.check_structure == CheckStructure::Full
+                                && previous == chunk.namespace
+                            {
+                                last_ns_entry_key = None;
+                            }
+                        }
+                    }
+
+                    // WIP...
+
+                    // Update chunk state for the next round
+                    last_chunk_seqno = Some(chunk.seqno);
+                    last_chunk_namespace = Some(chunk.namespace);
                 }
 
                 Record::Manifest(manifest) => {
