@@ -195,7 +195,7 @@ impl<R: Read + Seek> SclsReader<R> {
                             if options.check_integrity {
                                 ns_digests
                                     .entry(chunk.namespace.clone())
-                                    .or_insert_with(MerkleTree::new)
+                                    .or_default()
                                     .add_leaf(digest);
                             }
 
