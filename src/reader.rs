@@ -85,22 +85,26 @@ impl<R: Read + Seek> SclsReader<R> {
 
     /// Returns an iterator over records in the file.
     ///
-    /// The iterator starts from the reader's current position. Use this to parse SCLS files that
-    /// don't start at byte 0 (e.g., embedded within another format).
+    /// The iterator will rewind the reader if it is not currently at the start of the stream.
     ///
     /// # Errors
     ///
-    /// Returns an error if querying the reader's current position fails.
+    /// Returns an error if querying the reader's current position or rewinding fails.
     pub fn records(&mut self) -> Result<RecordIter<'_, R>> {
-        let current_offset = self.reader.stream_position()?;
+        // Rewind the reader if it's not at the start of the stream
+        if self.reader.stream_position()? != 0 {
+            self.reader.seek(std::io::SeekFrom::Start(0))?;
+        }
+
         Ok(RecordIter {
             reader: self,
-            current_offset,
             failed: false,
         })
     }
 
     /// Verify the SCLS file with the given options.
+    ///
+    /// The reader will be rewound if it is not currently at the start of the stream.
     ///
     /// # Errors
     ///
@@ -294,7 +298,6 @@ impl<R: Read + Seek> SclsReader<R> {
 /// An iterator over records in an SCLS file.
 pub struct RecordIter<'a, R> {
     reader: &'a mut SclsReader<R>,
-    current_offset: u64,
     failed: bool,
 }
 
@@ -315,16 +318,86 @@ pub enum Record {
 }
 
 impl Record {
+    /// Read and parse the next record from the reader's current position.
+    ///
+    /// Returns `Ok(None)` at end of file. Chunk records are parsed lazily -- only the header and
+    /// footer are read -- entry data is not loaded until explicitly requested via
+    /// [`Chunk::for_each_entry`] or [`Chunk::verify_and`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - An I/O error occurs
+    /// - The record has a zero-length payload
+    /// - The payload offset overflows a `u64`
+    /// - The record payload is malformed
+    fn read_next<R: Read + Seek>(reader: &mut R) -> Result<Option<Self>> {
+        // Read the 4-byte length prefix
+        let mut len_buf = [0u8; 4];
+        if let Err(e) = reader.read_exact(&mut len_buf) {
+            // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at
+            // the end of the file won't be picked up as a truncated/corrupted file; see issue #9.
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
+            }
+            return Err(e.into());
+        }
+
+        // Check the payload isn't empty
+        let payload_len = u32::from_be_bytes(len_buf);
+        if payload_len == 0 {
+            return Err(SclsError::MalformedRecord(
+                "zero length payload record".into(),
+            ));
+        }
+
+        // Read the 1-byte record type
+        let mut type_buf = [0u8; 1];
+        reader.read_exact(&mut type_buf)?;
+        let record_type = type_buf[0];
+
+        // The remaining payload length (excluding type byte)
+        let data_len = payload_len - 1;
+
+        // Handle chunks specially: parse directly from reader without buffering
+        if RecordType::from_byte(record_type) == Some(RecordType::Chunk) {
+            // Current position is payload start (after type byte)
+            let payload_start = reader.stream_position()?;
+
+            // Parse chunk directly from reader (reads only header + footer)
+            let chunk_result = Chunk::parse(reader, payload_start, data_len);
+
+            // Byte offset for next record
+            let next_offset = match payload_start.checked_add(data_len as u64) {
+                Some(offset) => offset,
+                None => return Err(SclsError::MalformedRecord("offset overflow".into())),
+            };
+
+            // Seek to end of record and return the parsed chunk
+            reader.seek(std::io::SeekFrom::Start(next_offset))?;
+            return chunk_result.map(Record::Chunk).map(Some);
+        }
+
+        // For non-chunk records, read the full payload into a buffer
+        let mut data = vec![0u8; data_len as usize];
+        reader.read_exact(&mut data)?;
+
+        // Parse based on type
+        Record::parse(record_type, &data).map(Some)
+    }
+
     /// Parses a non-chunk record from its type byte and payload data.
     ///
-    /// Note: Chunk records are parsed directly from the reader in `RecordIter::next` to achieve
+    /// Note: Chunk records are parsed directly from the reader in `Record::read_next` to achieve
     /// lazy loading, so this method will return an error for chunk types.
     fn parse(record_type: u8, data: &[u8]) -> Result<Self> {
         match RecordType::from_byte(record_type) {
             Some(RecordType::Header) => Ok(Self::Header(data.try_into()?)),
 
             // Chunks are parsed directly from the reader, not here
-            Some(RecordType::Chunk) => unreachable!(),
+            Some(RecordType::Chunk) => {
+                unreachable!("chunk records are parsed in Record::read_next")
+            }
 
             Some(RecordType::Manifest) => Ok(Self::Manifest(data.try_into()?)),
 
@@ -352,108 +425,15 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             return None;
         }
 
-        // Read the 4-byte length prefix
-        // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at the
-        // end of the file won't be picked up as a truncated/corrupted file; see issue #9.
-        let mut len_buf = [0u8; 4];
-        match self.reader.reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+        // Parse the next record
+        match Record::read_next(&mut self.reader.reader) {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None,
             Err(e) => {
                 self.failed = true;
-                return Some(Err(e.into()));
+                Some(Err(e))
             }
         }
-
-        // Update offset immediately after successful read, before any validation
-        self.current_offset = match self.current_offset.checked_add(4) {
-            Some(offset) => offset,
-            None => {
-                self.failed = true;
-                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-            }
-        };
-
-        let payload_len = u32::from_be_bytes(len_buf);
-
-        // Check the payload isn't empty
-        if payload_len == 0 {
-            self.failed = true;
-            return Some(Err(SclsError::MalformedRecord(
-                "zero length payload record".into(),
-            )));
-        }
-
-        // Read the 1-byte record type
-        let mut type_buf = [0u8; 1];
-        if let Err(e) = self.reader.reader.read_exact(&mut type_buf) {
-            self.failed = true;
-            return Some(Err(e.into()));
-        }
-
-        // Update offset immediately after successful read
-        self.current_offset = match self.current_offset.checked_add(1) {
-            Some(offset) => offset,
-            None => {
-                self.failed = true;
-                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-            }
-        };
-
-        let record_type = type_buf[0];
-
-        // The remaining payload length (excluding type byte)
-        let data_len = (payload_len - 1) as u64;
-
-        // Handle chunks specially: parse directly from reader without buffering
-        if RecordType::from_byte(record_type) == Some(RecordType::Chunk) {
-            // Current position is payload start (after type byte)
-            let payload_start = self.current_offset;
-
-            // Parse chunk directly from reader (reads only header + footer)
-            let chunk_result =
-                Chunk::parse(&mut self.reader.reader, payload_start, data_len as u32);
-
-            // Update offset to end of record
-            self.current_offset = match self.current_offset.checked_add(data_len) {
-                Some(offset) => offset,
-                None => {
-                    self.failed = true;
-                    return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-                }
-            };
-
-            // Seek to end of record for next iteration
-            if let Err(e) = self
-                .reader
-                .reader
-                .seek(std::io::SeekFrom::Start(self.current_offset))
-            {
-                self.failed = true;
-                return Some(Err(e.into()));
-            }
-
-            return Some(chunk_result.map(Record::Chunk));
-        }
-
-        // For non-chunk records, read the full payload into a buffer
-        let mut data = vec![0u8; data_len as usize];
-        if let Err(e) = self.reader.reader.read_exact(&mut data) {
-            self.failed = true;
-            return Some(Err(e.into()));
-        }
-
-        // Update offset
-        self.current_offset = match self.current_offset.checked_add(data_len) {
-            Some(offset) => offset,
-            None => {
-                self.failed = true;
-                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-            }
-        };
-
-        // Parse based on type
-        Some(Record::parse(record_type, &data))
     }
 }
 
