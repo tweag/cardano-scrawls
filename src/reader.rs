@@ -171,6 +171,8 @@ impl<R: Read + Seek> SclsReader<R> {
 
                     // Verify the chunk and post-process each entry
                     if options.check_integrity || options.check_structure == CheckStructure::Full {
+                        let pos = self.reader.stream_position()?;
+
                         chunk.verify_and(&mut self.reader, |digest, reader, key_len, _| {
                             if options.check_structure == CheckStructure::Full {
                                 // Materialise the key
@@ -201,6 +203,9 @@ impl<R: Read + Seek> SclsReader<R> {
 
                             Ok(())
                         })?;
+
+                        // Rewind
+                        self.reader.seek(std::io::SeekFrom::Start(pos))?;
                     }
 
                     // Update chunk state for the next round
@@ -472,7 +477,7 @@ mod tests {
     use crate::error::Result;
     use crate::types::{ChunkFormat, Entry};
 
-    use super::{Record, SclsReader};
+    use super::{Record, SclsReader, VerifyOptions};
 
     /// Slurped in fixture generated from Haskell reference implementation:
     ///
@@ -505,7 +510,7 @@ mod tests {
     const MANIFEST_OFFSET: RangeInclusive<usize> = 0x138..=0x13b;
 
     #[test]
-    fn minimal_fixture() -> Result<()> {
+    fn read_minimal_fixture() -> Result<()> {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
 
@@ -633,5 +638,12 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn verify_minimal_fixture() -> Result<()> {
+        let scls = Cursor::new(FIXTURE);
+        let mut reader = SclsReader::new(scls);
+        reader.verify(VerifyOptions::full())
     }
 }
