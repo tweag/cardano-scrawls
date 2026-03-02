@@ -233,6 +233,12 @@ impl<R: Read + Seek> SclsReader<R> {
                         })
                         .collect();
 
+                    if ns_info.len() != manifest.namespace_info.len() {
+                        return Err(SclsError::MalformedRecord(
+                            "manifest contains duplicate namespaces".into(),
+                        ));
+                    }
+
                     // Chunk namespaces must match manifest namespaces
                     let chunk_namespaces: BTreeSet<&String> = ns_chunks.keys().collect();
                     let manifest_namespaces: BTreeSet<&String> = ns_info.keys().collect();
@@ -286,7 +292,13 @@ impl<R: Read + Seek> SclsReader<R> {
                         for (namespace, (_, _, digest)) in &ns_info {
                             // Check namespace root digests match computed
                             let expected = *digest;
-                            let computed = ns_digests.remove(namespace).unwrap().root();
+                            let computed = match ns_digests.remove(namespace) {
+                                Some(tree) => tree.root(),
+
+                                // For the case where a namespace has no entries
+                                None => MerkleTree::new().root(),
+                            };
+
                             if expected != computed {
                                 return Err(SclsError::NamespaceDigestMismatch {
                                     namespace: namespace.to_string(),
