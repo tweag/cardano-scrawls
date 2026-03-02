@@ -102,14 +102,22 @@ impl<R: Read + Seek> SclsReader<R> {
         })
     }
 
-    /// Verify the SCLS file with the given options.
+    /// Verify the SCLS file with the given [`VerifyOptions`].
     ///
-    /// The reader will be rewound if it is not currently at the start of the stream.
+    /// The reader is rewound to the start of the stream before verification begins.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - TODO
+    /// - An I/O or parse error occurs
+    /// - Chunk sequence numbers are not strictly increasing
+    /// - Chunk namespaces are not in bytewise ascending order
+    /// - Entry keys are not in ascending order within a namespace
+    /// - The set of namespaces in chunks differs from the manifest
+    /// - Namespace chunk or entry counts differ from the manifest
+    /// - A chunk digest does not match its computed value
+    /// - A namespace Merkle root does not match its computed value
+    /// - The global Merkle root does not match its computed value
     pub fn verify(&mut self, options: VerifyOptions) -> Result<()> {
         if !options.check_structure.enabled() && !options.check_integrity {
             // This is vacuous, but technically allowed
@@ -123,32 +131,13 @@ impl<R: Read + Seek> SclsReader<R> {
         let mut ns_entries: BTreeMap<String, u64> = BTreeMap::new();
         let mut ns_digests: BTreeMap<String, MerkleTree> = BTreeMap::new();
 
-        // TODO
-        // - [x] Iterate through records
-        // - [ ] For chunks:
-        //   - [x] Update the current seqno and namespace
-        //     - if CheckStructure::Simple
-        //       - [x] Check monotonicity of seqno and namespace
-        //     - if namespace has changed and CheckStructure::Full
-        //       - [x] reset last_namespace_key
-        //   - if check_integrity:
-        //     - [ ] Verify the chunk
-        //   - if CheckStructure::Full
-        //     - [ ] Iterate through entries and update last namespace key
-        //     - [ ] Check monotonicity
-        //   - [ ] Add entry digest to namespace Merkle tree
-        // - [x] For manifest
-        //   - [x] Namespace sets are the same
-        //   - if CheckStructure::Simple
-        //     - [x] Namespace chunk count matches
-        //     - [x] Namespace entry count matches
-        //   - if check_integrity
-        //     - [x] Check namespace Merkle roots
-        //     - [x] Construct global Merkle tree from namespace roots in ascending order by namespace, prepended with 0x01
-        //     - [x] Check global Merkle root
+        // Rewind the reader if it's not at the start of the stream
+        if self.reader.stream_position()? != 0 {
+            self.reader.seek(std::io::SeekFrom::Start(0))?;
+        }
 
-        for record in self.records()? {
-            match record? {
+        while let Some(record) = Record::read_next(&mut self.reader)? {
+            match record {
                 Record::Chunk(chunk) => {
                     if options.check_structure.enabled() {
                         // Check strict monotonicity of chunk sequence number
@@ -173,16 +162,53 @@ impl<R: Read + Seek> SclsReader<R> {
                             // Reset last namespace's last entry key if the namespaces changes
                             // during a full check
                             if options.check_structure == CheckStructure::Full
-                                && previous == chunk.namespace
+                                && previous != chunk.namespace
                             {
                                 last_ns_entry_key = None;
                             }
                         }
                     }
 
-                    // WIP...
+                    // Verify the chunk and post-process each entry
+                    if options.check_integrity || options.check_structure == CheckStructure::Full {
+                        chunk.verify_and(&mut self.reader, |digest, reader, key_len, _| {
+                            if options.check_structure == CheckStructure::Full {
+                                // Materialise the key
+                                let mut key_buf = vec![0u8; key_len as usize];
+                                reader.read_exact(&mut key_buf)?;
+
+                                // Check strict monotonicity of chunk entry keys
+                                if let Some(previous) = &last_ns_entry_key
+                                    && *previous >= key_buf
+                                {
+                                    return Err(SclsError::KeysDisordered {
+                                        namespace: chunk.namespace.clone(),
+                                        seqno: chunk.seqno,
+                                    });
+                                }
+
+                                // Update chunk state for the next round
+                                last_ns_entry_key = Some(key_buf);
+                            }
+
+                            // Update namespace Merkle tree with the entry digest
+                            if options.check_integrity {
+                                ns_digests
+                                    .entry(chunk.namespace.clone())
+                                    .or_insert_with(MerkleTree::new)
+                                    .add_leaf(digest);
+                            }
+
+                            Ok(())
+                        })?;
+                    }
 
                     // Update chunk state for the next round
+                    // NOTE We assume that the chunk footer is accurate
+                    *ns_chunks.entry(chunk.namespace.clone()).or_insert(0) += 1;
+                    *ns_entries.entry(chunk.namespace.clone()).or_insert(0) +=
+                        chunk.footer.entries_count as u64;
+
                     last_chunk_seqno = Some(chunk.seqno);
                     last_chunk_namespace = Some(chunk.namespace);
                 }
