@@ -23,7 +23,7 @@ pub enum CheckStructure {
     Simple,
 
     /// [Simple verification](CheckStructure::Simple), plus verify that:
-    /// - chunk keys are in lexicographically ascending order.
+    /// - Entry keys are in lexicographically ascending order per namespace.
     ///
     /// Note: This requires key materialisation and, hence, more memory.
     Full,
@@ -322,6 +322,9 @@ impl<R: Read + Seek> SclsReader<R> {
             };
         }
 
+        // TODO We don't currently check the input's record sequence structure, which is important
+        // (e.g., with `check_integrity` but no manifest, the input will validate). This will be
+        // resolved in a subsequent PR.
         Ok(())
     }
 }
