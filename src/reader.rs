@@ -5,7 +5,7 @@ use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
 use crate::hash::{Blake2b, Digest, MerkleTree};
-use crate::types::{Chunk, Header, Manifest, RecordType};
+use crate::records::{Chunk, Header, Manifest, RecordType};
 
 /// Structural integrity check options.
 #[derive(Debug, Eq, PartialEq)]
@@ -479,7 +479,7 @@ mod tests {
     use std::str;
 
     use crate::error::Result;
-    use crate::types::{ChunkFormat, Entry};
+    use crate::records::{ChunkFormat, Entry};
 
     use super::{Record, SclsReader, VerifyOptions};
 
