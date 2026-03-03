@@ -4,11 +4,8 @@ use std::collections::{BTreeMap, BTreeSet}; // To maintain key order
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::types::digest::HASH_SIZE;
-use crate::types::merkle::LEAF_PREFIX;
-use crate::types::{Chunk, Digest, Header, Manifest, MerkleTree, RecordType};
-
-use blake2b_simd::Params;
+use crate::hash::{Blake2b, Digest, MerkleTree};
+use crate::types::{Chunk, Header, Manifest, RecordType};
 
 /// Structural integrity check options.
 #[derive(Debug, Eq, PartialEq)]
@@ -308,17 +305,9 @@ impl<R: Read + Seek> SclsReader<R> {
                             }
 
                             // Update the global Merkle tree
-                            let ns_hash = Params::new()
-                                .hash_length(HASH_SIZE)
-                                .to_state()
-                                .update(&[LEAF_PREFIX])
-                                .update(expected.as_bytes())
-                                .finalize();
-
-                            let ns_hash_bytes: [u8; HASH_SIZE] =
-                                ns_hash.as_bytes().try_into().unwrap();
-
-                            global_merkle.add_leaf(Digest::new(ns_hash_bytes));
+                            let ns_digest =
+                                Blake2b::new_leaf().update(expected.as_bytes()).as_digest();
+                            global_merkle.add_leaf(ns_digest);
                         }
 
                         // Check the global Merkle root matches

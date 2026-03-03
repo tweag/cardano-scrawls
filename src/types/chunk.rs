@@ -4,11 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use crate::error::{Result, SclsError};
-use crate::types::Digest;
-use crate::types::digest::HASH_SIZE;
-use crate::types::merkle;
-
-use blake2b_simd::Params;
+use crate::hash::{Blake2b, Digest, HASH_SIZE};
 
 /// Maximum block size to feed the Blake2b hashing function.
 const BLOCK_SIZE: usize = 8 * 1024; // 8 KiB
@@ -422,15 +418,12 @@ impl Chunk {
             u64,    // value length
         ) -> Result<()>,
     {
-        let mut chunk_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
+        let mut chunk_hash = Blake2b::new_raw();
 
         self.for_each_entry(reader, |reader, key_len, value_len| {
             let pos = reader.stream_position()?;
-            let mut entry_hash_state = Params::new().hash_length(HASH_SIZE).to_state();
-
-            // Hash preamble
-            entry_hash_state.update(&[merkle::LEAF_PREFIX]);
-            entry_hash_state.update(self.namespace.as_bytes());
+            let mut entry_hash = Blake2b::new_leaf();
+            entry_hash.update(self.namespace.as_bytes());
 
             // Entry hash
             let mut buffer = [0u8; BLOCK_SIZE];
@@ -443,30 +436,22 @@ impl Chunk {
                 let buf = &mut buffer[..to_read];
                 reader.read_exact(buf)?;
 
-                entry_hash_state.update(buf);
+                entry_hash.update(buf);
 
                 remaining -= to_read as u64;
             }
 
-            // It's safe to unwrap here because we know our hash is HASH_SIZE bytes long
-            let entry_hash: [u8; HASH_SIZE] =
-                entry_hash_state.finalize().as_bytes().try_into().unwrap();
-
             // Update the chunk hash with the entry hash
-            chunk_hash_state.update(&entry_hash);
+            chunk_hash.update(entry_hash.as_digest().as_bytes());
 
             // Invoke the closure
             reader.seek(SeekFrom::Start(pos))?;
-            f(Digest::new(entry_hash), reader, key_len, value_len)
+            f(entry_hash.as_digest(), reader, key_len, value_len)
         })?;
-
-        // Again, this is safe to unwrap
-        let chunk_hash: [u8; HASH_SIZE] =
-            chunk_hash_state.finalize().as_bytes().try_into().unwrap();
 
         // Compare computed with expected chunk hashes
         let expected = self.footer.digest;
-        let computed = Digest::from(chunk_hash);
+        let computed = chunk_hash.as_digest();
 
         if expected != computed {
             return Err(SclsError::ChunkDigestMismatch {
@@ -484,19 +469,18 @@ impl Chunk {
 mod tests {
     use std::io::Cursor;
 
-    use blake2b_simd::Params;
     use proptest::prelude::*;
     use rand::prelude::*;
 
     use super::*;
 
-    const DUMMY_HASH: [u8; HASH_SIZE] = [0x00; HASH_SIZE];
+    const DUMMY_HASH: Digest = Digest::new([0x00; HASH_SIZE]);
 
     // Strategy to generate a single serialised entry, with its computed digest
     fn entry_bytes_with_digest(
         key_len: u32,
         namespace: String,
-    ) -> impl Strategy<Value = (Vec<u8>, [u8; HASH_SIZE])> {
+    ) -> impl Strategy<Value = (Vec<u8>, Digest)> {
         let key_len = key_len as usize;
 
         (
@@ -511,19 +495,13 @@ mod tests {
                 entry_bytes.extend_from_slice(&value);
 
                 // Compute entry hash
-                let hash_bytes: [u8; HASH_SIZE] = Params::new()
-                    .hash_length(HASH_SIZE)
-                    .to_state()
-                    .update(&[merkle::LEAF_PREFIX])
+                let entry_hash = Blake2b::new_leaf()
                     .update(namespace.as_bytes())
                     .update(&key)
                     .update(&value)
-                    .finalize()
-                    .as_bytes()
-                    .try_into()
-                    .unwrap();
+                    .as_digest();
 
-                (entry_bytes, hash_bytes)
+                (entry_bytes, entry_hash)
             })
     }
 
@@ -532,23 +510,21 @@ mod tests {
         key_len: u32,
         namespace: String,
         num_entries: usize,
-    ) -> impl Strategy<Value = (Vec<u8>, [u8; HASH_SIZE])> {
+    ) -> impl Strategy<Value = (Vec<u8>, Digest)> {
         prop::collection::vec(
             entry_bytes_with_digest(key_len, namespace),
             num_entries..=num_entries,
         )
         .prop_map(|entries| {
-            let mut hash_state = Params::new().hash_length(HASH_SIZE).to_state();
+            let mut chunk_hash = Blake2b::new_raw();
             let mut all_bytes = Vec::new();
 
             for (entry_bytes, entry_hash) in entries {
                 all_bytes.extend_from_slice(&entry_bytes);
-                hash_state.update(&entry_hash);
+                chunk_hash.update(entry_hash.as_bytes());
             }
 
-            let chunk_hash: [u8; HASH_SIZE] = hash_state.finalize().as_bytes().try_into().unwrap();
-
-            (all_bytes, chunk_hash)
+            (all_bytes, chunk_hash.as_digest())
         })
     }
 
@@ -567,7 +543,7 @@ mod tests {
                 namespace in Just(namespace),
                 num_entries in Just(num_entries),
             )
-        -> (u32, String, usize, Vec<u8>, [u8; HASH_SIZE]) {
+        -> (u32, String, usize, Vec<u8>, Digest) {
             let (bytes, hash) = entry_data;
             (key_len, namespace, num_entries, bytes, hash)
         }
@@ -581,7 +557,7 @@ mod tests {
         namespace: &[u8],
         num_entries: u32,
         entry_data: Vec<u8>,
-        chunk_hash: &[u8; HASH_SIZE],
+        chunk_hash: Digest,
     ) -> (Chunk, Cursor<Vec<u8>>) {
         let len_ns: u32 = namespace.len() as u32;
 
@@ -593,7 +569,7 @@ mod tests {
         payload.extend_from_slice(&key_len.to_be_bytes()); // key_len
         payload.extend_from_slice(&entry_data); // entries
         payload.extend_from_slice(&num_entries.to_be_bytes()); // footer: entries_count
-        payload.extend_from_slice(chunk_hash); // footer: chunk_hash
+        payload.extend_from_slice(chunk_hash.as_bytes()); // footer: chunk_hash
 
         let payload_len = payload.len() as u32;
         let mut cursor = Cursor::new(payload);
@@ -614,7 +590,7 @@ mod tests {
                 namespace.as_bytes(),
                 num_entries as u32,
                 entry_data,
-                &chunk_hash,
+                chunk_hash,
             )
         }
     }
@@ -648,7 +624,7 @@ mod tests {
         fn parse_entries_rejects_truncated_length(key_len in 1u32..=64) {
             // Only 2 bytes instead of 4 for length prefix
             let data = vec![0x00, 0x01];
-            let (chunk, mut cursor) = make_chunk(key_len, b"test", 1, data, &DUMMY_HASH);
+            let (chunk, mut cursor) = make_chunk(key_len, b"test", 1, data, DUMMY_HASH);
 
             let result = chunk.for_each_entry(&mut cursor, |_reader, _kl, _vl| Ok(()));
             prop_assert!(result.is_err());
@@ -660,7 +636,7 @@ mod tests {
             let mut data = 2u32.to_be_bytes().to_vec();
             data.extend_from_slice(&[0xff, 0xff]);
 
-            let (chunk, mut cursor) = make_chunk(key_len, b"test", 1, data, &DUMMY_HASH);
+            let (chunk, mut cursor) = make_chunk(key_len, b"test", 1, data, DUMMY_HASH);
 
             let result = chunk.for_each_entry(&mut cursor, |_reader, _kl, _vl| Ok(()));
             prop_assert!(result.is_err());
@@ -688,15 +664,15 @@ mod tests {
                 namespace.as_bytes(),
                 num_entries as u32,
                 entry_data,
-                &corrupted_hash,
+                corrupted_hash,
             );
 
             let verified = chunk.verify(&mut cursor);
             prop_assert!(verified.is_err());
 
             if let Err(SclsError::ChunkDigestMismatch { expected, computed, .. }) = verified {
-                prop_assert_eq!(expected.as_bytes(), corrupted_hash);
-                prop_assert_eq!(computed.as_bytes(), chunk_hash);
+                prop_assert_eq!(expected, corrupted_hash);
+                prop_assert_eq!(computed, chunk_hash);
             }
         }
 
@@ -720,14 +696,14 @@ mod tests {
                 namespace.as_bytes(),
                 num_entries as u32,
                 corrupted_entries,
-                &chunk_hash,
+                chunk_hash,
             );
 
             let verified = chunk.verify(&mut cursor);
             prop_assert!(verified.is_err());
 
             if let Err(SclsError::ChunkDigestMismatch { expected, computed, .. }) = verified {
-                prop_assert_eq!(expected.as_bytes(), chunk_hash);
+                prop_assert_eq!(expected, chunk_hash);
                 prop_assert_ne!(expected, computed);
             }
         }

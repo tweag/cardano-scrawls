@@ -8,24 +8,17 @@
 
 use std::sync::LazyLock;
 
-use crate::types::Digest;
-use crate::types::digest::HASH_SIZE;
-
-use blake2b_simd::Params;
+use super::{Blake2b, Digest};
 
 /// Domain separators
 pub const NODE_PREFIX: u8 = 0x00;
 pub const LEAF_PREFIX: u8 = 0x01;
 
 /// Empty hash for empty Merkle trees.
-static EMPTY: LazyLock<Digest> = LazyLock::new(|| {
-    let hash = Params::new().hash_length(HASH_SIZE).to_state().finalize();
-    let bytes: [u8; HASH_SIZE] = hash.as_bytes().try_into().unwrap();
-    Digest::new(bytes)
-});
+static EMPTY: LazyLock<Digest> = LazyLock::new(|| Blake2b::new_raw().as_digest());
 
 /// An incremental Merkle tree.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MerkleTree {
     // A vector of (Digest, tree depth) tuples, where leaf nodes have a depth of 0
     // We don't expect trees to be deeper than 256 levels, so a u8 will suffice
@@ -53,16 +46,10 @@ impl MerkleTree {
 
     /// Merge two digests to generate the node digest of `H(NODE_PREFIX || left || right)`.
     fn merge(left: &Digest, right: &Digest) -> Digest {
-        let merged = Params::new()
-            .hash_length(HASH_SIZE)
-            .to_state()
-            .update(&[NODE_PREFIX])
+        Blake2b::new_node()
             .update(left.as_bytes())
             .update(right.as_bytes())
-            .finalize();
-
-        let merged_bytes: [u8; HASH_SIZE] = merged.as_bytes().try_into().unwrap();
-        Digest::new(merged_bytes)
+            .as_digest()
     }
 
     /// Add a node, at a specified depth, to the Merkle tree.
@@ -130,6 +117,7 @@ impl Default for MerkleTree {
 
 #[cfg(test)]
 mod tests {
+    use super::super::HASH_SIZE;
     use super::*;
 
     use hex::FromHex;
@@ -175,17 +163,7 @@ mod tests {
 
     #[test]
     fn golden() {
-        let leaf = {
-            let hash = Params::new()
-                .hash_length(HASH_SIZE)
-                .to_state()
-                .update(&[LEAF_PREFIX])
-                .update(b"Test")
-                .finalize();
-
-            let bytes: [u8; HASH_SIZE] = hash.as_bytes().try_into().unwrap();
-            Digest::new(bytes)
-        };
+        let leaf = Blake2b::new_leaf().update(b"Test").as_digest();
 
         for (leaves, golden_bytestring) in GOLDEN.iter() {
             let computed_root = {
