@@ -1,69 +1,14 @@
 //! SCLS file reader and record parsing.
 
-use std::collections::{BTreeMap, BTreeSet}; // To maintain key order
+mod verify;
+
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::hash::{Blake2b, Digest, MerkleTree};
 use crate::records::{Chunk, Header, Manifest, RecordType};
 
-/// Structural integrity check options.
-#[derive(Debug, Eq, PartialEq)]
-pub enum CheckStructure {
-    /// Do not verify structural integrity.
-    Disabled,
-
-    /// Verify that:
-    /// - the chunk sequence is strictly monotonically increasing;
-    /// - chunk namespaces are in bytewise ascending order;
-    /// - manifest chunk and entry counts are correct for each namespace.
-    Simple,
-
-    /// [Simple verification](CheckStructure::Simple), plus verify that:
-    /// - Entry keys are in lexicographically ascending order per namespace.
-    ///
-    /// Note: This requires key materialisation and, hence, more memory.
-    Full,
-}
-
-impl CheckStructure {
-    /// Whether structural integrity verification is enabled.
-    pub fn enabled(&self) -> bool {
-        self != &CheckStructure::Disabled
-    }
-}
-
-/// SCLS file verification options
-#[derive(Debug, Eq, PartialEq)]
-pub struct VerifyOptions {
-    /// Check structural integrity
-    pub check_structure: CheckStructure,
-
-    /// Check that all digests are valid. That is:
-    /// - Chunk digests
-    /// - Namespace Merkle root digests
-    /// - The global Merkle root digest
-    pub check_integrity: bool,
-}
-
-impl VerifyOptions {
-    /// Full verification.
-    pub fn full() -> Self {
-        Self {
-            check_structure: CheckStructure::Full,
-            check_integrity: true,
-        }
-    }
-}
-
-impl Default for VerifyOptions {
-    fn default() -> Self {
-        Self {
-            check_structure: CheckStructure::Simple,
-            check_integrity: true,
-        }
-    }
-}
+use verify::VerifyState;
+pub use verify::{CheckStructure, VerifyOptions};
 
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {
@@ -121,12 +66,8 @@ impl<R: Read + Seek> SclsReader<R> {
             return Ok(());
         }
 
-        let mut last_chunk_seqno: Option<u64> = None;
-        let mut last_chunk_namespace: Option<String> = None;
-        let mut last_ns_entry_key: Option<Vec<u8>> = None;
-        let mut ns_chunks: BTreeMap<String, u64> = BTreeMap::new();
-        let mut ns_entries: BTreeMap<String, u64> = BTreeMap::new();
-        let mut ns_digests: BTreeMap<String, MerkleTree> = BTreeMap::new();
+        let mut state = VerifyState::new();
+        let full_structural = options.check_structure == CheckStructure::Full;
 
         // Rewind the reader if it's not at the start of the stream
         if self.reader.stream_position()? != 0 {
@@ -137,185 +78,26 @@ impl<R: Read + Seek> SclsReader<R> {
             match record {
                 Record::Chunk(chunk) => {
                     if options.check_structure.enabled() {
-                        // Check strict monotonicity of chunk sequence number
-                        if let Some(previous) = last_chunk_seqno
-                            && previous >= chunk.seqno
-                        {
-                            return Err(SclsError::SeqnoDisordered {
-                                previous,
-                                found: chunk.seqno,
-                            });
-                        }
-
-                        if let Some(previous) = last_chunk_namespace {
-                            // Check monotonicity of chunk namespace
-                            if previous > chunk.namespace {
-                                return Err(SclsError::NamespaceDisordered {
-                                    previous,
-                                    found: chunk.namespace,
-                                });
-                            }
-
-                            // Reset last namespace's last entry key if the namespaces changes
-                            // during a full check
-                            if options.check_structure == CheckStructure::Full
-                                && previous != chunk.namespace
-                            {
-                                last_ns_entry_key = None;
-                            }
-                        }
+                        state.check_chunk_ordering(&chunk, full_structural)?;
                     }
 
-                    // Verify the chunk and post-process each entry
-                    if options.check_integrity || options.check_structure == CheckStructure::Full {
-                        let pos = self.reader.stream_position()?;
-
-                        chunk.verify_and(&mut self.reader, |digest, reader, key_len, _| {
-                            if options.check_structure == CheckStructure::Full {
-                                // Materialise the key
-                                let mut key_buf = vec![0u8; key_len as usize];
-                                reader.read_exact(&mut key_buf)?;
-
-                                // Check strict monotonicity of chunk entry keys
-                                if let Some(previous) = &last_ns_entry_key
-                                    && *previous >= key_buf
-                                {
-                                    return Err(SclsError::KeysDisordered {
-                                        namespace: chunk.namespace.clone(),
-                                        seqno: chunk.seqno,
-                                    });
-                                }
-
-                                // Update chunk state for the next round
-                                last_ns_entry_key = Some(key_buf);
-                            }
-
-                            // Update namespace Merkle tree with the entry digest
-                            if options.check_integrity {
-                                ns_digests
-                                    .entry(chunk.namespace.clone())
-                                    .or_default()
-                                    .add_leaf(digest);
-                            }
-
-                            Ok(())
-                        })?;
-
-                        // Rewind
-                        self.reader.seek(std::io::SeekFrom::Start(pos))?;
+                    if options.check_integrity || full_structural {
+                        state.verify_chunk_entries(&chunk, &mut self.reader, &options)?;
                     }
 
-                    // Update chunk state for the next round
-                    // NOTE We assume that the chunk footer is accurate
-                    *ns_chunks.entry(chunk.namespace.clone()).or_insert(0) += 1;
-                    *ns_entries.entry(chunk.namespace.clone()).or_insert(0) +=
-                        chunk.footer.entries_count as u64;
-
-                    last_chunk_seqno = Some(chunk.seqno);
-                    last_chunk_namespace = Some(chunk.namespace);
+                    state.update_chunk_state(&chunk);
                 }
 
                 Record::Manifest(manifest) => {
-                    // Convert manifest namespace info vector into an ordered map of chunk count,
-                    // entry count and digest tuples. A BTree map is used to ensure entries are
-                    // ordered by namespace.
-                    let ns_info: BTreeMap<String, (u64, u64, Digest)> = manifest
-                        .namespace_info
-                        .iter()
-                        .map(|ns_info| {
-                            (
-                                ns_info.name.clone(),
-                                (ns_info.chunks_count, ns_info.entries_count, ns_info.digest),
-                            )
-                        })
-                        .collect();
+                    let ns_info = verify::build_ns_info(&manifest)?;
+                    state.check_manifest_namespace_sets(&ns_info)?;
 
-                    if ns_info.len() != manifest.namespace_info.len() {
-                        return Err(SclsError::MalformedRecord(
-                            "manifest contains duplicate namespaces".into(),
-                        ));
-                    }
-
-                    // Chunk namespaces must match manifest namespaces
-                    let chunk_namespaces: BTreeSet<&String> = ns_chunks.keys().collect();
-                    let manifest_namespaces: BTreeSet<&String> = ns_info.keys().collect();
-
-                    if chunk_namespaces != manifest_namespaces {
-                        // Only clone when necessary, for the error
-                        let in_chunks: Vec<String> =
-                            chunk_namespaces.into_iter().cloned().collect();
-                        let in_manifest: Vec<String> =
-                            manifest_namespaces.into_iter().cloned().collect();
-
-                        return Err(SclsError::NamespaceMismatch {
-                            in_chunks,
-                            in_manifest,
-                        });
-                    }
-
-                    // Check structure
                     if options.check_structure.enabled() {
-                        for (namespace, (chunk_count, entry_count, _)) in &ns_info {
-                            // Namespace chunk counts must match those in the manifest
-                            let expected = *chunk_count;
-                            let found = ns_chunks[namespace];
-                            if expected != found {
-                                return Err(SclsError::NamespaceChunkMismatch {
-                                    namespace: namespace.to_string(),
-                                    expected,
-                                    found,
-                                });
-                            }
-
-                            // Namespace entry counts must match those in the manifest
-                            let expected = *entry_count;
-                            let found = ns_entries[namespace];
-                            if expected != found {
-                                return Err(SclsError::NamespaceEntryMismatch {
-                                    namespace: namespace.to_string(),
-                                    expected,
-                                    found,
-                                });
-                            }
-                        }
+                        state.check_manifest_structure(&ns_info)?;
                     }
 
-                    // Check integrity
                     if options.check_integrity {
-                        let mut global_merkle: MerkleTree = MerkleTree::new();
-
-                        // Namespaces will be iterated through in order by virtue of the BTree map,
-                        // so the global Merkle tree's order will be correct
-                        for (namespace, (_, _, digest)) in &ns_info {
-                            // Check namespace root digests match computed
-                            let expected = *digest;
-                            let computed = match ns_digests.remove(namespace) {
-                                Some(tree) => tree.root(),
-
-                                // For the case where a namespace has no entries
-                                None => MerkleTree::new().root(),
-                            };
-
-                            if expected != computed {
-                                return Err(SclsError::NamespaceDigestMismatch {
-                                    namespace: namespace.to_string(),
-                                    expected,
-                                    computed,
-                                });
-                            }
-
-                            // Update the global Merkle tree
-                            let ns_digest =
-                                Blake2b::new_leaf().update(expected.as_bytes()).as_digest();
-                            global_merkle.add_leaf(ns_digest);
-                        }
-
-                        // Check the global Merkle root matches
-                        let expected = manifest.root_hash;
-                        let computed = global_merkle.root();
-                        if expected != computed {
-                            return Err(SclsError::GlobalDigestMismatch { expected, computed });
-                        }
+                        state.check_manifest_integrity(&manifest, &ns_info)?;
                     }
                 }
 
@@ -488,7 +270,7 @@ mod tests {
     /// ```sh
     /// scls-util debug generate minimal-raw.scls --namespace blocks/v0:1
     /// ```
-    const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/minimal-raw.scls");
+    const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/minimal-raw.scls");
 
     /// Fixture ranges extracted from the [Kaitai IDE](https://ide.kaitai.io), using the Kaitai
     /// specification defined in [CIP-0165](https://github.com/tweag/CIPs/tree/cip-canonical/CIP-0165)

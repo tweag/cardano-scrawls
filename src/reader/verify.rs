@@ -1,0 +1,341 @@
+//! SCLS file structural and integrity verification.
+
+use std::collections::{BTreeMap, BTreeSet}; // To maintain key order
+use std::io::{Read, Seek};
+
+use crate::error::{Result, SclsError};
+use crate::hash::{Blake2b, Digest, MerkleTree};
+use crate::records::{Chunk, Manifest};
+
+/// Structural integrity check options.
+#[derive(Debug, Eq, PartialEq)]
+pub enum CheckStructure {
+    /// Do not verify structural integrity.
+    Disabled,
+
+    /// Verify that:
+    /// - the chunk sequence is strictly monotonically increasing;
+    /// - chunk namespaces are in bytewise ascending order;
+    /// - manifest chunk and entry counts are correct for each namespace.
+    Simple,
+
+    /// [Simple verification](CheckStructure::Simple), plus verify that:
+    /// - Entry keys are in lexicographically ascending order per namespace.
+    ///
+    /// Note: This requires key materialisation and, hence, more memory.
+    Full,
+}
+
+impl CheckStructure {
+    /// Whether structural integrity verification is enabled.
+    pub fn enabled(&self) -> bool {
+        self != &Self::Disabled
+    }
+}
+
+/// SCLS file verification options.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifyOptions {
+    /// Check structural integrity.
+    pub check_structure: CheckStructure,
+
+    /// Check that all digests are valid. That is:
+    /// - Chunk digests
+    /// - Namespace Merkle root digests
+    /// - The global Merkle root digest
+    pub check_integrity: bool,
+}
+
+impl VerifyOptions {
+    /// Full verification.
+    pub fn full() -> Self {
+        Self {
+            check_structure: CheckStructure::Full,
+            check_integrity: true,
+        }
+    }
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            check_structure: CheckStructure::Simple,
+            check_integrity: true,
+        }
+    }
+}
+
+/// Alias for namespace chunk count, entry count and digest tuples.
+type NSInfo = (u64, u64, Digest);
+
+/// Verification state.
+#[derive(Debug)]
+pub(super) struct VerifyState {
+    last_chunk_seqno: Option<u64>,
+    last_chunk_namespace: Option<String>,
+    last_ns_entry_key: Option<Vec<u8>>,
+    ns_chunks: BTreeMap<String, u64>,
+    ns_entries: BTreeMap<String, u64>,
+    ns_digests: BTreeMap<String, MerkleTree>,
+}
+
+impl VerifyState {
+    /// Initialise verification state.
+    pub fn new() -> Self {
+        Self {
+            last_chunk_seqno: None,
+            last_chunk_namespace: None,
+            last_ns_entry_key: None,
+            ns_chunks: BTreeMap::new(),
+            ns_entries: BTreeMap::new(),
+            ns_digests: BTreeMap::new(),
+        }
+    }
+
+    /// Check that chunk sequence numbers are strictly monotonically increasing and that chunk
+    /// namespaces are in bytewise ascending order. When `full` is set, the last entry key is reset
+    /// on namespace change (to prepare for per-namespace key ordering checks).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A chunk's sequence number is not strictly greater than the previous
+    /// - A chunk's namespace is bytewise less than the previous
+    pub fn check_chunk_ordering(&mut self, chunk: &Chunk, full: bool) -> Result<()> {
+        // Check strict monotonicity of chunk sequence number
+        if let Some(previous) = self.last_chunk_seqno
+            && previous >= chunk.seqno
+        {
+            return Err(SclsError::SeqnoDisordered {
+                previous,
+                found: chunk.seqno,
+            });
+        }
+
+        if let Some(previous) = &self.last_chunk_namespace {
+            // Check monotonicity of chunk namespace
+            if previous > &chunk.namespace {
+                return Err(SclsError::NamespaceDisordered {
+                    previous: previous.to_string(),
+                    found: chunk.namespace.clone(),
+                });
+            }
+
+            // Reset last namespace's last entry key if the namespace changes during a full check
+            if full && previous != &chunk.namespace {
+                self.last_ns_entry_key = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify the chunk digest and post-process each entry. When full structural checking is
+    /// enabled, entry keys are checked for strict monotonicity within the namespace. When
+    /// integrity checking is enabled, the namespace Merkle tree is updated with each entry digest.
+    ///
+    /// The reader is rewound to its original position after verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - An I/O error occurs during reading or seeking
+    /// - The chunk digest does not match its computed value
+    /// - Entry keys are not in strictly ascending order within a namespace (when `check_structure`
+    ///   is [`CheckStructure::Full`])
+    pub fn verify_chunk_entries<R: Read + Seek>(
+        &mut self,
+        chunk: &Chunk,
+        reader: &mut R,
+        options: &VerifyOptions,
+    ) -> Result<()> {
+        let pos = reader.stream_position()?;
+
+        chunk.verify_and(reader, |digest, reader, key_len, _| {
+            if options.check_structure == CheckStructure::Full {
+                // Materialise the key
+                let mut key_buf = vec![0u8; key_len as usize];
+                reader.read_exact(&mut key_buf)?;
+
+                // Check strict monotonicity of chunk entry keys
+                if let Some(previous) = &self.last_ns_entry_key
+                    && *previous >= key_buf
+                {
+                    return Err(SclsError::KeysDisordered {
+                        namespace: chunk.namespace.clone(),
+                        seqno: chunk.seqno,
+                    });
+                }
+
+                // Update chunk state for the next round
+                self.last_ns_entry_key = Some(key_buf);
+            }
+
+            // Update namespace Merkle tree with the entry digest
+            if options.check_integrity {
+                self.ns_digests
+                    .entry(chunk.namespace.clone())
+                    .or_default()
+                    .add_leaf(digest);
+            }
+
+            Ok(())
+        })?;
+
+        // Rewind
+        reader.seek(std::io::SeekFrom::Start(pos))?;
+        Ok(())
+    }
+
+    /// Update accumulated chunk and entry counts and record the chunk's sequence number and
+    /// namespace for the next iteration.
+    pub fn update_chunk_state(&mut self, chunk: &Chunk) {
+        *self.ns_chunks.entry(chunk.namespace.clone()).or_insert(0) += 1;
+
+        // NOTE We assume that the chunk footer is accurate
+        *self.ns_entries.entry(chunk.namespace.clone()).or_insert(0) +=
+            chunk.footer.entries_count as u64;
+
+        self.last_chunk_seqno = Some(chunk.seqno);
+        self.last_chunk_namespace = Some(chunk.namespace.clone());
+    }
+
+    /// Check that the set of namespaces found in chunks matches those listed in the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the chunk namespace set differs from the manifest namespace set.
+    pub fn check_manifest_namespace_sets(&self, ns_info: &BTreeMap<String, NSInfo>) -> Result<()> {
+        // Chunk namespaces must match manifest namespaces
+        let chunk_namespaces: BTreeSet<&String> = self.ns_chunks.keys().collect();
+        let manifest_namespaces: BTreeSet<&String> = ns_info.keys().collect();
+
+        if chunk_namespaces != manifest_namespaces {
+            // Only clone when necessary, for the error
+            let in_chunks: Vec<String> = chunk_namespaces.into_iter().cloned().collect();
+            let in_manifest: Vec<String> = manifest_namespaces.into_iter().cloned().collect();
+
+            return Err(SclsError::NamespaceMismatch {
+                in_chunks,
+                in_manifest,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Check that per-namespace chunk and entry counts match those declared in the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A namespace's chunk count differs from the manifest
+    /// - A namespace's entry count differs from the manifest
+    pub fn check_manifest_structure(&self, ns_info: &BTreeMap<String, NSInfo>) -> Result<()> {
+        for (namespace, (chunk_count, entry_count, _)) in ns_info {
+            // Namespace chunk counts must match those in the manifest
+            let expected = *chunk_count;
+            let found = self.ns_chunks[namespace];
+            if expected != found {
+                return Err(SclsError::NamespaceChunkMismatch {
+                    namespace: namespace.to_string(),
+                    expected,
+                    found,
+                });
+            }
+
+            // Namespace entry counts must match those in the manifest
+            let expected = *entry_count;
+            let found = self.ns_entries[namespace];
+            if expected != found {
+                return Err(SclsError::NamespaceEntryMismatch {
+                    namespace: namespace.to_string(),
+                    expected,
+                    found,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify namespace Merkle root digests and the global Merkle root against the manifest.
+    ///
+    /// Each namespace's computed Merkle root (from accumulated entry digests) is compared to the
+    /// digest declared in the manifest. The namespace roots are then combined into a global Merkle
+    /// tree whose root is compared to [`Manifest::root_hash`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A namespace Merkle root does not match its computed value
+    /// - The global Merkle root does not match its computed value
+    pub fn check_manifest_integrity(
+        &mut self,
+        manifest: &Manifest,
+        ns_info: &BTreeMap<String, NSInfo>,
+    ) -> Result<()> {
+        let mut global_merkle: MerkleTree = MerkleTree::new();
+
+        // Namespaces will be iterated through in order by virtue of the BTree map, so the global
+        // Merkle tree's order will be correct
+        for (namespace, (_, _, digest)) in ns_info {
+            // Check namespace root digests match computed
+            let expected = *digest;
+            let computed = match self.ns_digests.remove(namespace) {
+                Some(tree) => tree.root(),
+
+                // For the case where a namespace has no entries
+                None => MerkleTree::new().root(),
+            };
+
+            if expected != computed {
+                return Err(SclsError::NamespaceDigestMismatch {
+                    namespace: namespace.to_string(),
+                    expected,
+                    computed,
+                });
+            }
+
+            // Update the global Merkle tree
+            let ns_digest = Blake2b::new_leaf().update(expected.as_bytes()).as_digest();
+            global_merkle.add_leaf(ns_digest);
+        }
+
+        // Check the global Merkle root matches
+        let expected = manifest.root_hash;
+        let computed = global_merkle.root();
+        if expected != computed {
+            return Err(SclsError::GlobalDigestMismatch { expected, computed });
+        }
+
+        Ok(())
+    }
+}
+
+/// Convert the manifest namespace information vector into an ordered map of chunk count, entry
+/// count and digest tuples. A [`BTreeMap`] is used to ensure entries are ordered by namespace.
+///
+/// # Errors
+///
+/// Returns an error if the manifest contains duplicate namespace names
+pub(super) fn build_ns_info(manifest: &Manifest) -> Result<BTreeMap<String, NSInfo>> {
+    let ns_info: BTreeMap<String, NSInfo> = manifest
+        .namespace_info
+        .iter()
+        .map(|ns_info| {
+            (
+                ns_info.name.clone(),
+                (ns_info.chunks_count, ns_info.entries_count, ns_info.digest),
+            )
+        })
+        .collect();
+
+    if ns_info.len() != manifest.namespace_info.len() {
+        return Err(SclsError::MalformedRecord(
+            "manifest contains duplicate namespaces".into(),
+        ));
+    }
+
+    Ok(ns_info)
+}
