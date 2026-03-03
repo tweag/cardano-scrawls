@@ -71,9 +71,9 @@ type NSInfo = (u64, u64, Digest);
 /// Verification state.
 #[derive(Debug)]
 pub(super) struct VerifyState {
-    last_chunk_seqno: Option<u64>,
-    last_chunk_namespace: Option<String>,
-    last_ns_entry_key: Option<Vec<u8>>,
+    prev_chunk_seqno: Option<u64>,
+    prev_chunk_namespace: Option<String>,
+    prev_ns_entry_key: Option<Vec<u8>>,
     ns_chunks: BTreeMap<String, u64>,
     ns_entries: BTreeMap<String, u64>,
     ns_digests: BTreeMap<String, MerkleTree>,
@@ -83,9 +83,9 @@ impl VerifyState {
     /// Initialise verification state.
     pub fn new() -> Self {
         Self {
-            last_chunk_seqno: None,
-            last_chunk_namespace: None,
-            last_ns_entry_key: None,
+            prev_chunk_seqno: None,
+            prev_chunk_namespace: None,
+            prev_ns_entry_key: None,
             ns_chunks: BTreeMap::new(),
             ns_entries: BTreeMap::new(),
             ns_digests: BTreeMap::new(),
@@ -93,8 +93,8 @@ impl VerifyState {
     }
 
     /// Check that chunk sequence numbers are strictly monotonically increasing and that chunk
-    /// namespaces are in bytewise ascending order. When `full` is set, the last entry key is reset
-    /// on namespace change (to prepare for per-namespace key ordering checks).
+    /// namespaces are in bytewise ascending order. When `full` is set, the previous entry key is
+    /// reset on namespace change (to prepare for per-namespace key ordering checks).
     ///
     /// # Errors
     ///
@@ -103,7 +103,7 @@ impl VerifyState {
     /// - A chunk's namespace is bytewise less than the previous
     pub fn check_chunk_ordering(&mut self, chunk: &Chunk, full: bool) -> Result<()> {
         // Check strict monotonicity of chunk sequence number
-        if let Some(previous) = self.last_chunk_seqno
+        if let Some(previous) = self.prev_chunk_seqno
             && previous >= chunk.seqno
         {
             return Err(SclsError::SeqnoDisordered {
@@ -112,7 +112,7 @@ impl VerifyState {
             });
         }
 
-        if let Some(previous) = &self.last_chunk_namespace {
+        if let Some(previous) = &self.prev_chunk_namespace {
             // Check monotonicity of chunk namespace
             if previous > &chunk.namespace {
                 return Err(SclsError::NamespaceDisordered {
@@ -121,9 +121,10 @@ impl VerifyState {
                 });
             }
 
-            // Reset last namespace's last entry key if the namespace changes during a full check
+            // Reset previous namespace's previous entry key if the namespace changes during a full
+            // check
             if full && previous != &chunk.namespace {
-                self.last_ns_entry_key = None;
+                self.prev_ns_entry_key = None;
             }
         }
 
@@ -158,7 +159,7 @@ impl VerifyState {
                 reader.read_exact(&mut key_buf)?;
 
                 // Check strict monotonicity of chunk entry keys
-                if let Some(previous) = &self.last_ns_entry_key
+                if let Some(previous) = &self.prev_ns_entry_key
                     && *previous >= key_buf
                 {
                     return Err(SclsError::KeysDisordered {
@@ -168,7 +169,7 @@ impl VerifyState {
                 }
 
                 // Update chunk state for the next round
-                self.last_ns_entry_key = Some(key_buf);
+                self.prev_ns_entry_key = Some(key_buf);
             }
 
             // Update namespace Merkle tree with the entry digest
@@ -196,8 +197,8 @@ impl VerifyState {
         *self.ns_entries.entry(chunk.namespace.clone()).or_insert(0) +=
             chunk.footer.entries_count as u64;
 
-        self.last_chunk_seqno = Some(chunk.seqno);
-        self.last_chunk_namespace = Some(chunk.namespace.clone());
+        self.prev_chunk_seqno = Some(chunk.seqno);
+        self.prev_chunk_namespace = Some(chunk.namespace.clone());
     }
 
     /// Check that the set of namespaces found in chunks matches those listed in the manifest.
@@ -338,4 +339,387 @@ pub(super) fn build_ns_info(manifest: &Manifest) -> Result<BTreeMap<String, NSIn
     }
 
     Ok(ns_info)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
+
+    use proptest::prelude::*;
+
+    use crate::error::SclsError;
+    use crate::hash::{Blake2b, Digest, HASH_SIZE, MerkleTree};
+    use crate::records::{Chunk, Manifest, NamespaceInfo, Summary};
+
+    use super::{NSInfo, VerifyState, build_ns_info};
+
+    const DUMMY_DIGEST: Digest = Digest::new([0x00; HASH_SIZE]);
+
+    /// Create a dummy [`Chunk`] with the given sequence number and namespace.
+    ///
+    /// The chunk has zero entries and a zero'd digest. Only `seqno` and `namespace` are
+    /// meaningful; the chunk is not valid for digest verification.
+    fn dummy_chunk(seqno: u64, namespace: &str) -> Chunk {
+        let ns_bytes = namespace.as_bytes();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&seqno.to_be_bytes());
+        payload.push(0x00); // Raw format
+        payload.extend_from_slice(&(ns_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(ns_bytes);
+        payload.extend_from_slice(&1u32.to_be_bytes()); // key_len
+        payload.extend_from_slice(&0u32.to_be_bytes()); // footer: entries_count
+        payload.extend_from_slice(DUMMY_DIGEST.as_bytes()); // footer: digest
+
+        let payload_len = payload.len() as u32;
+        let mut cursor = Cursor::new(payload);
+        Chunk::parse(&mut cursor, 0, payload_len).unwrap()
+    }
+
+    /// Helper to construct a minimal [`Manifest`] with the given root hash and namespace info.
+    fn dummy_manifest(root_hash: Digest, namespace_info: Vec<NamespaceInfo>) -> Manifest {
+        Manifest {
+            slot_no: 0,
+            total_entries: 0,
+            total_chunks: 0,
+            root_hash,
+            namespace_info,
+            prev_manifest: 0,
+            summary: Summary {
+                created_at: String::new(),
+                tool: String::new(),
+                comment: None,
+            },
+            offset: 0,
+        }
+    }
+
+    /* verify_chunk_entries **********************************************************************/
+
+    // TODO Test `verify_chunk_entries` with a multi-entry fixture once one is available. The
+    // current minimal fixture has only one entry and one chunk, so entry key ordering is trivially
+    // satisfied. A fixture with at least two entries in the same namespace would let us test both
+    // the happy path and key-ordering rejection.
+
+    /* check_chunk_ordering **********************************************************************/
+
+    prop_compose! {
+        /// Strategy that generates a (previous, current) seqno pair where current <= previous.
+        fn non_increasing_seqno_pair()
+            (previous in 0u64..=u64::MAX)
+            (current in 0u64..=previous, previous in Just(previous))
+        -> (u64, u64) {
+            (previous, current)
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn chunk_ordering_rejects_non_increasing_seqno(
+            (prev_seqno, this_seqno) in non_increasing_seqno_pair()
+        ) {
+            let mut state = VerifyState::new();
+            state.prev_chunk_seqno = Some(prev_seqno);
+
+            let chunk = dummy_chunk(this_seqno, "ns");
+            let result = state.check_chunk_ordering(&chunk, false);
+
+            let is_seqno_err = matches!(
+                result,
+                Err(SclsError::SeqnoDisordered { previous, found })
+                    if previous == prev_seqno && found == this_seqno
+            );
+            prop_assert!(is_seqno_err);
+        }
+    }
+
+    #[test]
+    fn chunk_ordering_rejects_namespace_decrease() {
+        let mut state = VerifyState::new();
+        state.prev_chunk_seqno = Some(0);
+        state.prev_chunk_namespace = Some("z".into());
+
+        let result = state.check_chunk_ordering(&dummy_chunk(1, "a"), false);
+        assert!(matches!(result, Err(SclsError::NamespaceDisordered { .. })));
+    }
+
+    #[test]
+    fn chunk_ordering_accepts_namespace_equal() {
+        let mut state = VerifyState::new();
+        state.prev_chunk_seqno = Some(0);
+        state.prev_chunk_namespace = Some("ns".into());
+
+        assert!(
+            state
+                .check_chunk_ordering(&dummy_chunk(1, "ns"), false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn chunk_ordering_resets_entry_key_on_namespace_change() {
+        let mut state = VerifyState::new();
+        state.prev_chunk_seqno = Some(0);
+        state.prev_chunk_namespace = Some("a".into());
+        state.prev_ns_entry_key = Some(vec![0xff]);
+
+        state
+            .check_chunk_ordering(&dummy_chunk(1, "b"), true)
+            .unwrap();
+        assert!(state.prev_ns_entry_key.is_none());
+    }
+
+    #[test]
+    fn chunk_ordering_preserves_entry_key_same_namespace() {
+        let mut state = VerifyState::new();
+        state.prev_chunk_seqno = Some(0);
+        state.prev_chunk_namespace = Some("a".into());
+        state.prev_ns_entry_key = Some(vec![0xff]);
+
+        state
+            .check_chunk_ordering(&dummy_chunk(1, "a"), true)
+            .unwrap();
+        assert!(state.prev_ns_entry_key.is_some());
+    }
+
+    /* check_manifest_namespace_sets *************************************************************/
+
+    proptest! {
+        #[test]
+        fn manifest_namespace_sets_accepts_matching(
+            namespaces in prop::collection::btree_set("[a-z]{1,8}", 1..=5)
+        ) {
+            let mut state = VerifyState::new();
+            let mut ns_info = BTreeMap::new();
+
+            for ns in &namespaces {
+                state.ns_chunks.insert(ns.clone(), 1);
+                ns_info.insert(ns.clone(), (1, 1, DUMMY_DIGEST));
+            }
+
+            prop_assert!(state.check_manifest_namespace_sets(&ns_info).is_ok());
+        }
+
+        #[test]
+        fn manifest_namespace_sets_rejects_mismatch(
+            chunk_ns in prop::collection::btree_set("[a-z]{1,8}", 1..=5),
+            manifest_ns in prop::collection::btree_set("[a-z]{1,8}", 1..=5),
+        ) {
+            prop_assume!(chunk_ns != manifest_ns);
+
+            let mut state = VerifyState::new();
+            for ns in &chunk_ns {
+                state.ns_chunks.insert(ns.clone(), 1);
+            }
+
+            let ns_info: BTreeMap<String, NSInfo> = manifest_ns.iter()
+                .map(|ns| (ns.clone(), (1, 1, DUMMY_DIGEST)))
+                .collect();
+
+            let is_mismatch = matches!(
+                state.check_manifest_namespace_sets(&ns_info),
+                Err(SclsError::NamespaceMismatch { .. })
+            );
+            prop_assert!(is_mismatch);
+        }
+    }
+
+    /* check_manifest_structure ******************************************************************/
+
+    proptest! {
+        #[test]
+        fn manifest_structure_accepts_matching_counts(
+            data in prop::collection::btree_map(
+                "[a-z]{1,8}", (1u64..=100, 1u64..=1000), 1..=5
+            )
+        ) {
+            let mut state = VerifyState::new();
+            let mut ns_info = BTreeMap::new();
+
+            for (ns, (chunks, entries)) in &data {
+                state.ns_chunks.insert(ns.clone(), *chunks);
+                state.ns_entries.insert(ns.clone(), *entries);
+                ns_info.insert(ns.clone(), (*chunks, *entries, DUMMY_DIGEST));
+            }
+
+            prop_assert!(state.check_manifest_structure(&ns_info).is_ok());
+        }
+
+        #[test]
+        fn manifest_structure_rejects_chunk_count_mismatch(
+            ns in "[a-z]{1,8}",
+            actual in 1u64..=100,
+            expected in 1u64..=100,
+            entries in 1u64..=1000,
+        ) {
+            prop_assume!(actual != expected);
+
+            let mut state = VerifyState::new();
+            state.ns_chunks.insert(ns.clone(), actual);
+            state.ns_entries.insert(ns.clone(), entries);
+
+            let mut ns_info = BTreeMap::new();
+            ns_info.insert(ns, (expected, entries, DUMMY_DIGEST));
+
+            let is_chunk_mismatch = matches!(
+                state.check_manifest_structure(&ns_info),
+                Err(SclsError::NamespaceChunkMismatch { .. })
+            );
+            prop_assert!(is_chunk_mismatch);
+        }
+
+        #[test]
+        fn manifest_structure_rejects_entry_count_mismatch(
+            ns in "[a-z]{1,8}",
+            chunks in 1u64..=100,
+            actual in 1u64..=1000,
+            expected in 1u64..=1000,
+        ) {
+            prop_assume!(actual != expected);
+
+            let mut state = VerifyState::new();
+            state.ns_chunks.insert(ns.clone(), chunks);
+            state.ns_entries.insert(ns.clone(), actual);
+
+            let mut ns_info = BTreeMap::new();
+            ns_info.insert(ns, (chunks, expected, DUMMY_DIGEST));
+
+            let is_entry_mismatch = matches!(
+                state.check_manifest_structure(&ns_info),
+                Err(SclsError::NamespaceEntryMismatch { .. })
+            );
+            prop_assert!(is_entry_mismatch);
+        }
+    }
+
+    /* check_manifest_integrity ******************************************************************/
+
+    #[test]
+    fn manifest_integrity_accepts_correct_digests() {
+        let mut state = VerifyState::new();
+
+        let leaf = Blake2b::new_leaf().update(b"test").as_digest();
+
+        let mut tree = MerkleTree::new();
+        tree.add_leaf(leaf);
+        state.ns_digests.insert("ns".into(), tree);
+
+        // Compute expected roots from an identical tree
+        let ns_root = {
+            let mut t = MerkleTree::new();
+            t.add_leaf(leaf);
+            t.root()
+        };
+        let global_root = {
+            let ns_leaf = Blake2b::new_leaf().update(ns_root.as_bytes()).as_digest();
+            let mut t = MerkleTree::new();
+            t.add_leaf(ns_leaf);
+            t.root()
+        };
+
+        let mut ns_info = BTreeMap::new();
+        ns_info.insert("ns".into(), (1u64, 1u64, ns_root));
+
+        let manifest = dummy_manifest(global_root, vec![]);
+        assert!(state.check_manifest_integrity(&manifest, &ns_info).is_ok());
+    }
+
+    #[test]
+    fn manifest_integrity_rejects_wrong_namespace_digest() {
+        let mut state = VerifyState::new();
+
+        let leaf = Blake2b::new_leaf().update(b"test").as_digest();
+        let mut tree = MerkleTree::new();
+        tree.add_leaf(leaf);
+        state.ns_digests.insert("ns".into(), tree);
+
+        let wrong_digest = Digest::new([0xff; HASH_SIZE]);
+        let mut ns_info = BTreeMap::new();
+        ns_info.insert("ns".into(), (1u64, 1u64, wrong_digest));
+
+        let manifest = dummy_manifest(DUMMY_DIGEST, vec![]);
+        assert!(matches!(
+            state.check_manifest_integrity(&manifest, &ns_info),
+            Err(SclsError::NamespaceDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_integrity_rejects_wrong_global_root() {
+        let mut state = VerifyState::new();
+
+        // Namespace with no entries — root is the empty tree root
+        let empty_root = MerkleTree::new().root();
+        let mut ns_info = BTreeMap::new();
+        ns_info.insert("ns".into(), (1u64, 0u64, empty_root));
+
+        let wrong_root = Digest::new([0xff; HASH_SIZE]);
+        let manifest = dummy_manifest(wrong_root, vec![]);
+
+        assert!(matches!(
+            state.check_manifest_integrity(&manifest, &ns_info),
+            Err(SclsError::GlobalDigestMismatch { .. })
+        ));
+    }
+
+    /* build_ns_info *****************************************************************************/
+
+    proptest! {
+        #[test]
+        fn build_ns_info_maps_namespace_info(
+            namespaces in prop::collection::btree_map(
+                "[a-z]{1,10}",
+                (any::<u64>(), any::<u64>(), prop::array::uniform28(any::<u8>())),
+                1..=5,
+            )
+        ) {
+            let manifest = dummy_manifest(
+                DUMMY_DIGEST,
+                namespaces.iter().map(|(name, (chunks, entries, digest))| {
+                    NamespaceInfo {
+                        name: name.clone(),
+                        chunks_count: *chunks,
+                        entries_count: *entries,
+                        digest: Digest::new(*digest),
+                    }
+                }).collect(),
+            );
+
+            let ns_info = build_ns_info(&manifest)?;
+            prop_assert_eq!(ns_info.len(), namespaces.len());
+
+            for (name, (chunks, entries, digest)) in &namespaces {
+                let (c, e, d) = &ns_info[name];
+                prop_assert_eq!(*c, *chunks);
+                prop_assert_eq!(*e, *entries);
+                prop_assert_eq!(*d, Digest::new(*digest));
+            }
+        }
+    }
+
+    #[test]
+    fn build_ns_info_rejects_duplicate_namespaces() {
+        let manifest = dummy_manifest(
+            DUMMY_DIGEST,
+            vec![
+                NamespaceInfo {
+                    name: "dup".into(),
+                    chunks_count: 1,
+                    entries_count: 1,
+                    digest: DUMMY_DIGEST,
+                },
+                NamespaceInfo {
+                    name: "dup".into(),
+                    chunks_count: 2,
+                    entries_count: 2,
+                    digest: Digest::new([0x01; HASH_SIZE]),
+                },
+            ],
+        );
+
+        assert!(matches!(
+            build_ns_info(&manifest),
+            Err(SclsError::MalformedRecord(_))
+        ));
+    }
 }
