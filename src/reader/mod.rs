@@ -123,7 +123,7 @@ pub struct RecordIter<'a, R> {
 }
 
 /// A parsed record from an SCLS file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Record {
     /// File header
     Header(Header),
