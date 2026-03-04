@@ -23,17 +23,31 @@ pub enum SclsError {
     #[error("malformed record: {0}")]
     MalformedRecord(String),
 
-    /// Structural: Record sequence number not increasing
+    /// Unknown record type encountered
+    #[error("unknown record type: 0x{0:02x}")]
+    UnknownRecordType(u8),
+
+    /* Record sequence verification errors *******************************************************/
+    /// Unexpected record type found in stream
+    #[error("unexpected record type: found {found}, expected {expected}")]
+    UnexpectedRecord { found: String, expected: String },
+
+    /// Unexpected EOF found in stream
+    #[error("unexpected EOF: expected {expected}")]
+    UnexpectedEof { expected: String },
+
+    /* Structural verification errors ************************************************************/
+    /// Record sequence number not increasing
     #[error("record sequence is not increasing: previous {previous}, found {found}")]
     SeqnoDisordered { previous: u64, found: u64 },
 
-    /// Structural: Chunk namespaces not in bytewise ascending order
+    /// Chunk namespaces not in bytewise ascending order
     #[error(
         "chunk namespaces are not in bytewise order: previous \"{previous}\", found \"{found}\""
     )]
     NamespaceDisordered { previous: String, found: String },
 
-    /// Structural: Entry keys not in lexicographically ascending order
+    /// Entry keys not in lexicographically ascending order
     ///
     /// Note: This check is not performed by default to avoid materialisation; see
     /// [`CheckStructure`](crate::reader::CheckStructure) and
@@ -43,14 +57,14 @@ pub enum SclsError {
     )]
     KeysDisordered { namespace: String, seqno: u64 },
 
-    /// Structural: Manifest namespace set differs from chunk namespaces
+    /// Manifest namespace set differs from chunk namespaces
     #[error("mismatching namespace sets: in chunks {in_chunks:?}, in manifest {in_manifest:?}")]
     NamespaceMismatch {
         in_chunks: Vec<String>,
         in_manifest: Vec<String>,
     },
 
-    /// Structural: Manifest namespace chunk counts differ
+    /// Manifest namespace chunk counts differ
     #[error("mismatching chunk counts for {namespace}: expected {expected}, found {found}")]
     NamespaceChunkMismatch {
         namespace: String,
@@ -58,7 +72,7 @@ pub enum SclsError {
         found: u64,
     },
 
-    /// Structural: Manifest namespace entry counts differ
+    /// Manifest namespace entry counts differ
     #[error("mismatching entry counts for {namespace}: expected {expected}, found {found}")]
     NamespaceEntryMismatch {
         namespace: String,
@@ -66,7 +80,8 @@ pub enum SclsError {
         found: u64,
     },
 
-    /// Integrity: Chunk digest mismatch
+    /* Integrity verification errors *************************************************************/
+    /// Chunk digest mismatch
     #[error("mismatching digest in chunk {seqno}: expected {expected}, computed {computed}")]
     ChunkDigestMismatch {
         seqno: u64,
@@ -74,7 +89,7 @@ pub enum SclsError {
         computed: Digest,
     },
 
-    /// Integrity: Namespace root digest mismatch
+    /// Namespace root digest mismatch
     #[error(
         "mismatching namespace root digest for {namespace}: expected {expected}, computed {computed}"
     )]
@@ -84,13 +99,9 @@ pub enum SclsError {
         computed: Digest,
     },
 
-    /// Integrity: Global root digest mismatch
+    /// Global root digest mismatch
     #[error("mismatching global root digest: expected {expected}, computed {computed}")]
     GlobalDigestMismatch { expected: Digest, computed: Digest },
-
-    /// Unknown record type encountered
-    #[error("unknown record type: 0x{0:02x}")]
-    UnknownRecordType(u8),
 }
 
 /// Convenience type alias for Results with SclsError.
