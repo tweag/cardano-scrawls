@@ -1,5 +1,6 @@
 //! SCLS file reader and record parsing.
 
+mod seq_state;
 mod verify;
 
 use std::io::{Read, Seek};
@@ -7,6 +8,7 @@ use std::io::{Read, Seek};
 use crate::error::{Result, SclsError};
 use crate::records::{Chunk, Header, Manifest, RecordType};
 
+use seq_state::RecordSequence;
 use verify::VerifyState;
 pub use verify::{CheckStructure, VerifyOptions};
 
@@ -52,6 +54,7 @@ impl<R: Read + Seek> SclsReader<R> {
     ///
     /// Returns an error if:
     /// - An I/O or parse error occurs
+    /// - The record sequence does not meet expectations
     /// - Chunk sequence numbers are not strictly increasing
     /// - Chunk namespaces are not in bytewise ascending order
     /// - Entry keys are not in ascending order within a namespace
@@ -74,7 +77,11 @@ impl<R: Read + Seek> SclsReader<R> {
             self.reader.seek(std::io::SeekFrom::Start(0))?;
         }
 
+        let mut sequence = RecordSequence::new();
+
         while let Some(record) = Record::read_next(&mut self.reader)? {
+            sequence.update(&record)?;
+
             match record {
                 Record::Chunk(chunk) => {
                     if options.check_structure.enabled() {
@@ -105,10 +112,7 @@ impl<R: Read + Seek> SclsReader<R> {
             };
         }
 
-        // TODO We don't currently check the input's record sequence structure, which is important
-        // (e.g., with `check_integrity` but no manifest, the input will validate). This will be
-        // resolved in a subsequent PR.
-        Ok(())
+        sequence.update(&Record::Eof)
     }
 }
 
@@ -119,7 +123,7 @@ pub struct RecordIter<'a, R> {
 }
 
 /// A parsed record from an SCLS file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Record {
     /// File header
     Header(Header),
@@ -132,6 +136,9 @@ pub enum Record {
 
     /// Unknown record (can be safely skipped)
     Unknown { record_type: u8, data: Vec<u8> },
+
+    /// A dummy entry that doesn't map to an SCLS record, but demarcates the end of the file
+    Eof,
 }
 
 impl Record {
@@ -273,7 +280,7 @@ mod tests {
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/minimal-raw.scls");
 
     /// Fixture ranges extracted from the [Kaitai IDE](https://ide.kaitai.io), using the Kaitai
-    /// specification defined in [CIP-0165](https://github.com/tweag/CIPs/tree/cip-canonical/CIP-0165)
+    /// specification defined in [CIP-0165](https://github.com/cardano-foundation/CIPs/tree/master/CIP-0165)
     const HEADER_VERSION: RangeInclusive<usize> = 0x9..=0xc;
     const CHUNK_SEQ_NO: RangeInclusive<usize> = 0x12..=0x19;
     const CHUNK_NAMESPACE: RangeInclusive<usize> = 0x1f..=0x27;
