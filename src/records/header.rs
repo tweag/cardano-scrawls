@@ -91,9 +91,12 @@ impl TryFrom<&[u8]> for Header {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use proptest::prelude::*;
 
     use super::*;
+    use crate::reader::Record;
 
     proptest! {
         #[test]
@@ -130,5 +133,22 @@ mod tests {
             prop_assert!(result.is_ok());
             prop_assert_eq!(result.unwrap().version, version);
         }
+    }
+
+    #[test]
+    fn roundtrip() -> Result<()> {
+        let mut sink: Vec<u8> = Vec::new();
+
+        let written = Header::current();
+        written.write(&mut sink)?;
+
+        let mut source = Cursor::new(sink);
+        let record = Record::read_next(&mut source)?;
+        let Some(Record::Header(read)) = record else {
+            panic!("expected header record, got {record:?}");
+        };
+        assert_eq!(read, written);
+
+        Ok(())
     }
 }

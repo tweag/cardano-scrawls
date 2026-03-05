@@ -153,7 +153,7 @@ impl Record {
     /// - The record has a zero-length payload
     /// - The payload offset overflows a `u64`
     /// - The record payload is malformed
-    fn read_next<R: Read + Seek>(reader: &mut R) -> Result<Option<Self>> {
+    pub fn read_next<R: Read + Seek>(reader: &mut R) -> Result<Option<Self>> {
         // Read the 4-byte length prefix
         let mut len_buf = [0u8; 4];
         if let Err(e) = reader.read_exact(&mut len_buf) {
