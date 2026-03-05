@@ -1,9 +1,72 @@
 //! SCLS file reader and record parsing.
 
+use std::collections::{BTreeMap, BTreeSet}; // To maintain key order
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
-use crate::types::{Chunk, Header, Manifest, RecordType};
+use crate::types::digest::HASH_SIZE;
+use crate::types::merkle::LEAF_PREFIX;
+use crate::types::{Chunk, Digest, Header, Manifest, MerkleTree, RecordType};
+
+use blake2b_simd::Params;
+
+/// Structural integrity check options.
+#[derive(Debug, Eq, PartialEq)]
+pub enum CheckStructure {
+    /// Do not verify structural integrity.
+    Disabled,
+
+    /// Verify that:
+    /// - the chunk sequence is strictly monotonically increasing;
+    /// - chunk namespaces are in bytewise ascending order;
+    /// - manifest chunk and entry counts are correct for each namespace.
+    Simple,
+
+    /// [Simple verification](CheckStructure::Simple), plus verify that:
+    /// - Entry keys are in lexicographically ascending order per namespace.
+    ///
+    /// Note: This requires key materialisation and, hence, more memory.
+    Full,
+}
+
+impl CheckStructure {
+    /// Whether structural integrity verification is enabled.
+    pub fn enabled(&self) -> bool {
+        self != &CheckStructure::Disabled
+    }
+}
+
+/// SCLS file verification options
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifyOptions {
+    /// Check structural integrity
+    pub check_structure: CheckStructure,
+
+    /// Check that all digests are valid. That is:
+    /// - Chunk digests
+    /// - Namespace Merkle root digests
+    /// - The global Merkle root digest
+    pub check_integrity: bool,
+}
+
+impl VerifyOptions {
+    /// Full verification.
+    pub fn full() -> Self {
+        Self {
+            check_structure: CheckStructure::Full,
+            check_integrity: true,
+        }
+    }
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            check_structure: CheckStructure::Simple,
+            check_integrity: true,
+        }
+    }
+}
 
 /// A reader for SCLS files that can iterate over records.
 pub struct SclsReader<R> {
@@ -22,26 +85,265 @@ impl<R: Read + Seek> SclsReader<R> {
 
     /// Returns an iterator over records in the file.
     ///
-    /// The iterator starts from the reader's current position. Use this to parse SCLS files that
-    /// don't start at byte 0 (e.g., embedded within another format).
+    /// The iterator will rewind the reader if it is not currently at the start of the stream.
     ///
     /// # Errors
     ///
-    /// Returns an error if querying the reader's current position fails.
+    /// Returns an error if querying the reader's current position or rewinding fails.
     pub fn records(&mut self) -> Result<RecordIter<'_, R>> {
-        let current_offset = self.reader.stream_position()?;
+        // Rewind the reader if it's not at the start of the stream
+        if self.reader.stream_position()? != 0 {
+            self.reader.seek(std::io::SeekFrom::Start(0))?;
+        }
+
         Ok(RecordIter {
             reader: self,
-            current_offset,
             failed: false,
         })
+    }
+
+    /// Verify the SCLS file with the given [`VerifyOptions`].
+    ///
+    /// The reader is rewound to the start of the stream before verification begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - An I/O or parse error occurs
+    /// - Chunk sequence numbers are not strictly increasing
+    /// - Chunk namespaces are not in bytewise ascending order
+    /// - Entry keys are not in ascending order within a namespace
+    /// - The set of namespaces in chunks differs from the manifest
+    /// - Namespace chunk or entry counts differ from the manifest
+    /// - A chunk digest does not match its computed value
+    /// - A namespace Merkle root does not match its computed value
+    /// - The global Merkle root does not match its computed value
+    pub fn verify(&mut self, options: VerifyOptions) -> Result<()> {
+        if !options.check_structure.enabled() && !options.check_integrity {
+            // This is vacuous, but technically allowed
+            return Ok(());
+        }
+
+        let mut last_chunk_seqno: Option<u64> = None;
+        let mut last_chunk_namespace: Option<String> = None;
+        let mut last_ns_entry_key: Option<Vec<u8>> = None;
+        let mut ns_chunks: BTreeMap<String, u64> = BTreeMap::new();
+        let mut ns_entries: BTreeMap<String, u64> = BTreeMap::new();
+        let mut ns_digests: BTreeMap<String, MerkleTree> = BTreeMap::new();
+
+        // Rewind the reader if it's not at the start of the stream
+        if self.reader.stream_position()? != 0 {
+            self.reader.seek(std::io::SeekFrom::Start(0))?;
+        }
+
+        while let Some(record) = Record::read_next(&mut self.reader)? {
+            match record {
+                Record::Chunk(chunk) => {
+                    if options.check_structure.enabled() {
+                        // Check strict monotonicity of chunk sequence number
+                        if let Some(previous) = last_chunk_seqno
+                            && previous >= chunk.seqno
+                        {
+                            return Err(SclsError::SeqnoDisordered {
+                                previous,
+                                found: chunk.seqno,
+                            });
+                        }
+
+                        if let Some(previous) = last_chunk_namespace {
+                            // Check monotonicity of chunk namespace
+                            if previous > chunk.namespace {
+                                return Err(SclsError::NamespaceDisordered {
+                                    previous,
+                                    found: chunk.namespace,
+                                });
+                            }
+
+                            // Reset last namespace's last entry key if the namespaces changes
+                            // during a full check
+                            if options.check_structure == CheckStructure::Full
+                                && previous != chunk.namespace
+                            {
+                                last_ns_entry_key = None;
+                            }
+                        }
+                    }
+
+                    // Verify the chunk and post-process each entry
+                    if options.check_integrity || options.check_structure == CheckStructure::Full {
+                        let pos = self.reader.stream_position()?;
+
+                        chunk.verify_and(&mut self.reader, |digest, reader, key_len, _| {
+                            if options.check_structure == CheckStructure::Full {
+                                // Materialise the key
+                                let mut key_buf = vec![0u8; key_len as usize];
+                                reader.read_exact(&mut key_buf)?;
+
+                                // Check strict monotonicity of chunk entry keys
+                                if let Some(previous) = &last_ns_entry_key
+                                    && *previous >= key_buf
+                                {
+                                    return Err(SclsError::KeysDisordered {
+                                        namespace: chunk.namespace.clone(),
+                                        seqno: chunk.seqno,
+                                    });
+                                }
+
+                                // Update chunk state for the next round
+                                last_ns_entry_key = Some(key_buf);
+                            }
+
+                            // Update namespace Merkle tree with the entry digest
+                            if options.check_integrity {
+                                ns_digests
+                                    .entry(chunk.namespace.clone())
+                                    .or_default()
+                                    .add_leaf(digest);
+                            }
+
+                            Ok(())
+                        })?;
+
+                        // Rewind
+                        self.reader.seek(std::io::SeekFrom::Start(pos))?;
+                    }
+
+                    // Update chunk state for the next round
+                    // NOTE We assume that the chunk footer is accurate
+                    *ns_chunks.entry(chunk.namespace.clone()).or_insert(0) += 1;
+                    *ns_entries.entry(chunk.namespace.clone()).or_insert(0) +=
+                        chunk.footer.entries_count as u64;
+
+                    last_chunk_seqno = Some(chunk.seqno);
+                    last_chunk_namespace = Some(chunk.namespace);
+                }
+
+                Record::Manifest(manifest) => {
+                    // Convert manifest namespace info vector into an ordered map of chunk count,
+                    // entry count and digest tuples. A BTree map is used to ensure entries are
+                    // ordered by namespace.
+                    let ns_info: BTreeMap<String, (u64, u64, Digest)> = manifest
+                        .namespace_info
+                        .iter()
+                        .map(|ns_info| {
+                            (
+                                ns_info.name.clone(),
+                                (ns_info.chunks_count, ns_info.entries_count, ns_info.digest),
+                            )
+                        })
+                        .collect();
+
+                    if ns_info.len() != manifest.namespace_info.len() {
+                        return Err(SclsError::MalformedRecord(
+                            "manifest contains duplicate namespaces".into(),
+                        ));
+                    }
+
+                    // Chunk namespaces must match manifest namespaces
+                    let chunk_namespaces: BTreeSet<&String> = ns_chunks.keys().collect();
+                    let manifest_namespaces: BTreeSet<&String> = ns_info.keys().collect();
+
+                    if chunk_namespaces != manifest_namespaces {
+                        // Only clone when necessary, for the error
+                        let in_chunks: Vec<String> =
+                            chunk_namespaces.into_iter().cloned().collect();
+                        let in_manifest: Vec<String> =
+                            manifest_namespaces.into_iter().cloned().collect();
+
+                        return Err(SclsError::NamespaceMismatch {
+                            in_chunks,
+                            in_manifest,
+                        });
+                    }
+
+                    // Check structure
+                    if options.check_structure.enabled() {
+                        for (namespace, (chunk_count, entry_count, _)) in &ns_info {
+                            // Namespace chunk counts must match those in the manifest
+                            let expected = *chunk_count;
+                            let found = ns_chunks[namespace];
+                            if expected != found {
+                                return Err(SclsError::NamespaceChunkMismatch {
+                                    namespace: namespace.to_string(),
+                                    expected,
+                                    found,
+                                });
+                            }
+
+                            // Namespace entry counts must match those in the manifest
+                            let expected = *entry_count;
+                            let found = ns_entries[namespace];
+                            if expected != found {
+                                return Err(SclsError::NamespaceEntryMismatch {
+                                    namespace: namespace.to_string(),
+                                    expected,
+                                    found,
+                                });
+                            }
+                        }
+                    }
+
+                    // Check integrity
+                    if options.check_integrity {
+                        let mut global_merkle: MerkleTree = MerkleTree::new();
+
+                        // Namespaces will be iterated through in order by virtue of the BTree map,
+                        // so the global Merkle tree's order will be correct
+                        for (namespace, (_, _, digest)) in &ns_info {
+                            // Check namespace root digests match computed
+                            let expected = *digest;
+                            let computed = match ns_digests.remove(namespace) {
+                                Some(tree) => tree.root(),
+
+                                // For the case where a namespace has no entries
+                                None => MerkleTree::new().root(),
+                            };
+
+                            if expected != computed {
+                                return Err(SclsError::NamespaceDigestMismatch {
+                                    namespace: namespace.to_string(),
+                                    expected,
+                                    computed,
+                                });
+                            }
+
+                            // Update the global Merkle tree
+                            let ns_hash = Params::new()
+                                .hash_length(HASH_SIZE)
+                                .to_state()
+                                .update(&[LEAF_PREFIX])
+                                .update(expected.as_bytes())
+                                .finalize();
+
+                            let ns_hash_bytes: [u8; HASH_SIZE] =
+                                ns_hash.as_bytes().try_into().unwrap();
+
+                            global_merkle.add_leaf(Digest::new(ns_hash_bytes));
+                        }
+
+                        // Check the global Merkle root matches
+                        let expected = manifest.root_hash;
+                        let computed = global_merkle.root();
+                        if expected != computed {
+                            return Err(SclsError::GlobalDigestMismatch { expected, computed });
+                        }
+                    }
+                }
+
+                _ => {}
+            };
+        }
+
+        // TODO We don't currently check the input's record sequence structure, which is important
+        // (e.g., with `check_integrity` but no manifest, the input will validate). This will be
+        // resolved in a subsequent PR.
+        Ok(())
     }
 }
 
 /// An iterator over records in an SCLS file.
 pub struct RecordIter<'a, R> {
     reader: &'a mut SclsReader<R>,
-    current_offset: u64,
     failed: bool,
 }
 
@@ -62,16 +364,86 @@ pub enum Record {
 }
 
 impl Record {
+    /// Read and parse the next record from the reader's current position.
+    ///
+    /// Returns `Ok(None)` at end of file. Chunk records are parsed lazily -- only the header and
+    /// footer are read -- entry data is not loaded until explicitly requested via
+    /// [`Chunk::for_each_entry`] or [`Chunk::verify_and`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - An I/O error occurs
+    /// - The record has a zero-length payload
+    /// - The payload offset overflows a `u64`
+    /// - The record payload is malformed
+    fn read_next<R: Read + Seek>(reader: &mut R) -> Result<Option<Self>> {
+        // Read the 4-byte length prefix
+        let mut len_buf = [0u8; 4];
+        if let Err(e) = reader.read_exact(&mut len_buf) {
+            // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at
+            // the end of the file won't be picked up as a truncated/corrupted file; see issue #9.
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None);
+            }
+            return Err(e.into());
+        }
+
+        // Check the payload isn't empty
+        let payload_len = u32::from_be_bytes(len_buf);
+        if payload_len == 0 {
+            return Err(SclsError::MalformedRecord(
+                "zero length payload record".into(),
+            ));
+        }
+
+        // Read the 1-byte record type
+        let mut type_buf = [0u8; 1];
+        reader.read_exact(&mut type_buf)?;
+        let record_type = type_buf[0];
+
+        // The remaining payload length (excluding type byte)
+        let data_len = payload_len - 1;
+
+        // Handle chunks specially: parse directly from reader without buffering
+        if RecordType::from_byte(record_type) == Some(RecordType::Chunk) {
+            // Current position is payload start (after type byte)
+            let payload_start = reader.stream_position()?;
+
+            // Parse chunk directly from reader (reads only header + footer)
+            let chunk_result = Chunk::parse(reader, payload_start, data_len);
+
+            // Byte offset for next record
+            let next_offset = match payload_start.checked_add(data_len as u64) {
+                Some(offset) => offset,
+                None => return Err(SclsError::MalformedRecord("offset overflow".into())),
+            };
+
+            // Seek to end of record and return the parsed chunk
+            reader.seek(std::io::SeekFrom::Start(next_offset))?;
+            return chunk_result.map(Record::Chunk).map(Some);
+        }
+
+        // For non-chunk records, read the full payload into a buffer
+        let mut data = vec![0u8; data_len as usize];
+        reader.read_exact(&mut data)?;
+
+        // Parse based on type
+        Record::parse(record_type, &data).map(Some)
+    }
+
     /// Parses a non-chunk record from its type byte and payload data.
     ///
-    /// Note: Chunk records are parsed directly from the reader in `RecordIter::next` to achieve
+    /// Note: Chunk records are parsed directly from the reader in `Record::read_next` to achieve
     /// lazy loading, so this method will return an error for chunk types.
     fn parse(record_type: u8, data: &[u8]) -> Result<Self> {
         match RecordType::from_byte(record_type) {
             Some(RecordType::Header) => Ok(Self::Header(data.try_into()?)),
 
             // Chunks are parsed directly from the reader, not here
-            Some(RecordType::Chunk) => unreachable!(),
+            Some(RecordType::Chunk) => {
+                unreachable!("chunk records are parsed in Record::read_next")
+            }
 
             Some(RecordType::Manifest) => Ok(Self::Manifest(data.try_into()?)),
 
@@ -99,108 +471,15 @@ impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
             return None;
         }
 
-        // Read the 4-byte length prefix
-        // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at the
-        // end of the file won't be picked up as a truncated/corrupted file; see issue #9.
-        let mut len_buf = [0u8; 4];
-        match self.reader.reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+        // Parse the next record
+        match Record::read_next(&mut self.reader.reader) {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None,
             Err(e) => {
                 self.failed = true;
-                return Some(Err(e.into()));
+                Some(Err(e))
             }
         }
-
-        // Update offset immediately after successful read, before any validation
-        self.current_offset = match self.current_offset.checked_add(4) {
-            Some(offset) => offset,
-            None => {
-                self.failed = true;
-                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-            }
-        };
-
-        let payload_len = u32::from_be_bytes(len_buf);
-
-        // Check the payload isn't empty
-        if payload_len == 0 {
-            self.failed = true;
-            return Some(Err(SclsError::MalformedRecord(
-                "zero length payload record".into(),
-            )));
-        }
-
-        // Read the 1-byte record type
-        let mut type_buf = [0u8; 1];
-        if let Err(e) = self.reader.reader.read_exact(&mut type_buf) {
-            self.failed = true;
-            return Some(Err(e.into()));
-        }
-
-        // Update offset immediately after successful read
-        self.current_offset = match self.current_offset.checked_add(1) {
-            Some(offset) => offset,
-            None => {
-                self.failed = true;
-                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-            }
-        };
-
-        let record_type = type_buf[0];
-
-        // The remaining payload length (excluding type byte)
-        let data_len = (payload_len - 1) as u64;
-
-        // Handle chunks specially: parse directly from reader without buffering
-        if RecordType::from_byte(record_type) == Some(RecordType::Chunk) {
-            // Current position is payload start (after type byte)
-            let payload_start = self.current_offset;
-
-            // Parse chunk directly from reader (reads only header + footer)
-            let chunk_result =
-                Chunk::parse(&mut self.reader.reader, payload_start, data_len as u32);
-
-            // Update offset to end of record
-            self.current_offset = match self.current_offset.checked_add(data_len) {
-                Some(offset) => offset,
-                None => {
-                    self.failed = true;
-                    return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-                }
-            };
-
-            // Seek to end of record for next iteration
-            if let Err(e) = self
-                .reader
-                .reader
-                .seek(std::io::SeekFrom::Start(self.current_offset))
-            {
-                self.failed = true;
-                return Some(Err(e.into()));
-            }
-
-            return Some(chunk_result.map(Record::Chunk));
-        }
-
-        // For non-chunk records, read the full payload into a buffer
-        let mut data = vec![0u8; data_len as usize];
-        if let Err(e) = self.reader.reader.read_exact(&mut data) {
-            self.failed = true;
-            return Some(Err(e.into()));
-        }
-
-        // Update offset
-        self.current_offset = match self.current_offset.checked_add(data_len) {
-            Some(offset) => offset,
-            None => {
-                self.failed = true;
-                return Some(Err(SclsError::MalformedRecord("offset overflow".into())));
-            }
-        };
-
-        // Parse based on type
-        Some(Record::parse(record_type, &data))
     }
 }
 
@@ -213,7 +492,7 @@ mod tests {
     use crate::error::Result;
     use crate::types::{ChunkFormat, Entry};
 
-    use super::{Record, SclsReader};
+    use super::{Record, SclsReader, VerifyOptions};
 
     /// Slurped in fixture generated from Haskell reference implementation:
     ///
@@ -246,7 +525,7 @@ mod tests {
     const MANIFEST_OFFSET: RangeInclusive<usize> = 0x138..=0x13b;
 
     #[test]
-    fn minimal_fixture() -> Result<()> {
+    fn read_minimal_fixture() -> Result<()> {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
 
@@ -374,5 +653,12 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn verify_minimal_fixture() -> Result<()> {
+        let scls = Cursor::new(FIXTURE);
+        let mut reader = SclsReader::new(scls);
+        reader.verify(VerifyOptions::full())
     }
 }
