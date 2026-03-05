@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use crate::error::{Result, SclsError};
+use crate::records::Header;
 
 /// Default tool name.
 pub const DEFAULT_TOOL: &str = "cardano-scrawls";
@@ -58,16 +59,18 @@ impl<W: Write> SclsWriterBuilder<W> {
         self
     }
 
-    /// Build an [`SclsWriter`] given the current parameters.
+    /// Build an [`SclsWriter`] given the current parameters and write the header record.
     ///
     /// # Errors
     ///
-    /// Returns an error if any required parameters have been omitted.
+    /// Returns an error if:
+    /// - Any required parameters have been omitted
+    /// - I/O failure when writing the header
     pub fn build(self) -> Result<SclsWriter<W>> {
         let output = self.output.ok_or(SclsError::WriterBuilderMissingOutput)?;
         let slot_no = self.slot_no.ok_or(SclsError::WriterBuilderMissingSlotNo)?;
 
-        let writer = SclsWriter {
+        let mut writer = SclsWriter {
             output,
             slot_no,
             tool: self.tool,
@@ -76,6 +79,9 @@ impl<W: Write> SclsWriterBuilder<W> {
             prev_namespace: None,
             prev_ns_entry_key: None,
         };
+
+        let header = Header::current();
+        header.write(&mut writer.output)?;
 
         Ok(writer)
     }
