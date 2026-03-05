@@ -73,6 +73,8 @@ impl<W: Write> SclsWriterBuilder<W> {
             tool: self.tool,
             comment: self.comment,
             max_chunk_size: self.max_chunk_size,
+            prev_namespace: None,
+            prev_ns_entry_key: None,
         };
 
         Ok(writer)
@@ -107,11 +109,41 @@ pub struct SclsWriter<W> {
 
     /// Ideal maximum chunk size (bytes)
     max_chunk_size: usize,
+
+    /// Previously written namespace
+    prev_namespace: Option<String>,
+
+    /// Previously written namespace entry key
+    // NOTE Reset this to `None` when `prev_namespace` changes
+    prev_ns_entry_key: Option<Vec<u8>>,
 }
 
 impl<W: Write> SclsWriter<W> {
     /// Build a new writer incrementally from its parameters.
     pub fn builder() -> SclsWriterBuilder<W> {
         SclsWriterBuilder::new()
+    }
+
+    /// Write an entry to the SCLS output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    /// - The namespace is not the same or bytewise ascending from previously written namespaces
+    /// - The entry key is not strictly lexicographically monotonic for previously written entry
+    ///   keys in the given namespace
+    /// - TODO
+    pub fn write_entry(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        todo!()
+    }
+
+    /// Finalise the SCLS output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - TODO
+    pub fn finalise(self) -> Result<()> {
+        todo!()
     }
 }
