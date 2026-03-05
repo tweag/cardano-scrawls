@@ -7,6 +7,7 @@ use thiserror::Error;
 /// Errors that can occur when reading or writing SCLS files.
 #[derive(Error, Debug)]
 pub enum SclsError {
+    /* Parsing errors ****************************************************************************/
     /// Invalid magic bytes in header
     #[error("invalid magic bytes: expected 'SCLS', found {found:?}")]
     InvalidMagic { found: Vec<u8> },
@@ -102,6 +103,15 @@ pub enum SclsError {
     /// Global root digest mismatch
     #[error("mismatching global root digest: expected {expected}, computed {computed}")]
     GlobalDigestMismatch { expected: Digest, computed: Digest },
+
+    /* Writer errors *****************************************************************************/
+    /// Writer builder missing required output parameter
+    #[error("writer builder is missing its required output parameter")]
+    WriterBuilderMissingOutput,
+
+    /// Writer builder missing required slot number parameter
+    #[error("writer builder is missing its required slot number parameter")]
+    WriterBuilderMissingSlotNo,
 }
 
 /// Convenience type alias for Results with SclsError.
