@@ -112,6 +112,18 @@ pub enum SclsError {
     /// Writer builder missing required slot number parameter
     #[error("writer builder is missing its required slot number parameter")]
     WriterBuilderMissingSlotNo,
+
+    /// Entry attribute length overflow
+    #[error("entry key/value length overflow")]
+    EntryOverflow,
+
+    /// Inconsistent entry key lengths within a namespace
+    #[error("inconsistent entry key length in {namespace}: expected {expected}, found {found}")]
+    InconsistentKeyLength {
+        namespace: String,
+        expected: usize,
+        found: usize,
+    },
 }
 
 /// Convenience type alias for Results with SclsError.

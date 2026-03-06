@@ -81,6 +81,9 @@ impl<W: Write> SclsWriterBuilder<W> {
             max_chunk_size: self.max_chunk_size,
             prev_namespace: None,
             prev_ns_entry_key: None,
+            chunk_seqno: 0,
+            current_chunk: None,
+            ns_state: BTreeMap::new(),
         };
 
         let header = Header::current();
@@ -105,6 +108,9 @@ impl<W: Write> Default for SclsWriterBuilder<W> {
 /// Namespace state tracking.
 #[derive(Debug)]
 struct NamespaceState {
+    /// Namespace key length
+    key_len: Option<u32>,
+
     /// Number of chunks in the namespace
     chunks: u64,
 
@@ -118,6 +124,7 @@ struct NamespaceState {
 impl NamespaceState {
     fn new() -> Self {
         Self {
+            key_len: None,
             chunks: 0,
             entries: 0,
             merkle: MerkleTree::new(),
@@ -212,23 +219,21 @@ impl<W: Write> SclsWriter<W> {
         //       - [ ] Reset previous key
         //       - [ ] Create new ns_state
         //     - [ ] Fail => Error
-        //  - [ ] Check entry key
-        //    - [ ] Previous None =>
-        //      - [ ] Set previous key
-        //    - Check strict monotonicity:
-        //      - [ ] OK => Update previous key
-        //      - [ ] Fail => Error
-        //  - [ ] Is previous chunk, if it exists, oversized => Flush chunk
-        //  - [ ] Is current chunk None => Create new chunk
-        //  - [ ] Build chunk
+        // - [ ] Check entry key
+        //   - [ ] Previous None =>
+        //     - [ ] Set previous key
+        //   - Check strict monotonicity:
+        //     - [ ] OK => Update previous key
+        //     - [ ] Fail => Error
+        // - [ ] Is previous chunk, if it exists, oversized => Flush chunk
+        // - [ ] Is current chunk None => Create new chunk
+        // - [x] Update chunk
         //
-        //  SclsWriter::build_chunk - namespace, key, value
-        //  - [ ] Compute entry digest
-        //  - [ ] Update chunk digest accumulator
-        //  - [ ] Add leaf to namespace Merkle tree
-        //  - [ ] Serialise entry into chunk buffer
-        //
-        //  NOTE: Finalise will have to call build_chunk to empty what's left in the buffer
+        // SclsWriter::update_chunk - namespace, key, value
+        // - [x] Compute entry digest
+        // - [x] Update chunk digest accumulator
+        // - [x] Add leaf to namespace Merkle tree
+        // - [x] Serialise entry into chunk buffer
         //
         // ChunkState::write - writer (SclsWriter.output), seqno (SclsWriter.chunk_seqno), namespace (SclsWriter.prev_namespace)
         // OR SclsWriter::flush_chunk - chunk state [cleaner]
@@ -236,8 +241,90 @@ impl<W: Write> SclsWriter<W> {
         // - [ ] Increment chunk_seqno
         // - [ ] Update ns_state[namespace].{chunks, entries}
         // - [ ] Reset current_chunk to None
+        //
+        //  NOTE: Finalise will have to call flush_chunk to empty what's left in the buffer
+
+        self.update_chunk(key, value)
+    }
+
+    /// Update the chunk that is currently being built with the next entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The entry, its key or its value has length greater than 2^32 bytes
+    /// - Entry key length is inconsistent within the same namespace
+    fn update_chunk(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let Some(namespace) = &self.prev_namespace else {
+            unreachable!("must only be called when the namespace is set");
+        };
+
+        let Some(chunk) = &mut self.current_chunk else {
+            unreachable!("must only be called when the current chunk is set");
+        };
+
+        let Some(ns_state) = self.ns_state.get_mut(namespace) else {
+            unreachable!("must only be called when the namespace state is set")
+        };
+
+        // Set and check the key length, as necessary
+        match ns_state.key_len {
+            Some(key_len) => {
+                // Key length consistency check
+                if key.len() != key_len as usize {
+                    return Err(SclsError::InconsistentKeyLength {
+                        namespace: namespace.clone(),
+                        expected: key_len as usize,
+                        found: key.len(),
+                    });
+                }
+            }
+
+            None => {
+                // Checked truncation
+                let key_len = u32::try_from(key.len()).map_err(|_| SclsError::EntryOverflow)?;
+                ns_state.key_len = Some(key_len);
+            }
+        };
+
+        // Compute entry digest
+        let entry_digest = Blake2b::new_leaf()
+            .update(namespace.as_bytes())
+            .update(key)
+            .update(value)
+            .as_digest();
+
+        // Update chunk digest and namespace Merkle tree
+        chunk.digest.update(entry_digest.as_bytes());
+        ns_state.merkle.add_leaf(entry_digest);
+
+        // Serialise entry
+        let entry_len = u32::try_from(
+            key.len()
+                .checked_add(value.len())
+                .ok_or(SclsError::EntryOverflow)?,
+        )
+        .map_err(|_| SclsError::EntryOverflow)?;
+
+        chunk.entries += 1;
+        chunk.payload.extend_from_slice(&entry_len.to_be_bytes());
+        chunk.payload.extend_from_slice(key);
+        chunk.payload.extend_from_slice(value);
+
         Ok(())
     }
+
+    // TODO: Flush chunk
+    // len_record (4) = 1 + 8 + 1 + 4 + len_ns + 4 + len(entries) + 4 + 28
+    // type byte (1)
+    // seqno (8)
+    // format (1)
+    // len_ns (4)
+    // namespace (len_ns)
+    // len_key (4)
+    // entries payload
+    // entries_count (4)
+    // digest (28)
 
     /// Finalise the SCLS output.
     ///
