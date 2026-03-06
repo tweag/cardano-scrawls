@@ -1,8 +1,10 @@
 //! SCLS file writing.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::error::{Result, SclsError};
+use crate::hash::{Blake2b, MerkleTree};
 use crate::records::Header;
 
 /// Default tool name.
@@ -12,6 +14,7 @@ pub const DEFAULT_TOOL: &str = "cardano-scrawls";
 pub const DEFAULT_MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
 /// SclsWriter builder.
+#[derive(Debug)]
 pub struct SclsWriterBuilder<W: Write> {
     output: Option<W>,
     slot_no: Option<u64>,
@@ -99,7 +102,54 @@ impl<W: Write> Default for SclsWriterBuilder<W> {
     }
 }
 
+/// Namespace state tracking.
+#[derive(Debug)]
+struct NamespaceState {
+    /// Number of chunks in the namespace
+    chunks: u64,
+
+    /// Number of entries in the namespace
+    entries: u64,
+
+    /// Merkle tree for namespace
+    merkle: MerkleTree,
+}
+
+impl NamespaceState {
+    fn new() -> Self {
+        Self {
+            chunks: 0,
+            entries: 0,
+            merkle: MerkleTree::new(),
+        }
+    }
+}
+
+/// Chunk state tracking.
+#[derive(Debug)]
+struct ChunkState {
+    /// Serialised entries payload
+    payload: Vec<u8>,
+
+    /// Chunk digest
+    digest: Blake2b,
+
+    /// Number of entries in the chunk
+    entries: u32,
+}
+
+impl ChunkState {
+    fn new() -> Self {
+        Self {
+            payload: Vec::new(),
+            digest: Blake2b::new_raw(),
+            entries: 0,
+        }
+    }
+}
+
 /// A writer for SCLS files.
+#[derive(Debug)]
 pub struct SclsWriter<W> {
     /// Output sink
     output: W,
@@ -116,12 +166,22 @@ pub struct SclsWriter<W> {
     /// Ideal maximum chunk size (bytes)
     max_chunk_size: usize,
 
+    /* State tracking */
     /// Previously written namespace
     prev_namespace: Option<String>,
 
     /// Previously written namespace entry key
     // NOTE Reset this to `None` when `prev_namespace` changes
     prev_ns_entry_key: Option<Vec<u8>>,
+
+    /// Chunk sequence number
+    chunk_seqno: u64,
+
+    /// Chunk state
+    current_chunk: Option<ChunkState>,
+
+    /// Namespace state
+    ns_state: BTreeMap<String, NamespaceState>,
 }
 
 impl<W: Write> SclsWriter<W> {
@@ -140,7 +200,43 @@ impl<W: Write> SclsWriter<W> {
     ///   keys in the given namespace
     /// - TODO
     pub fn write_entry(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<()> {
-        todo!()
+        // SclsWriter::write_entry - namespace, key, value
+        // - [ ] Check namespace:
+        //   - [ ] Previous None =>
+        //     - [ ] Set previous namespace
+        //     - [ ] Create new ns_state
+        //   - [ ] Check monotonicity if changed:
+        //     - [ ] OK =>
+        //       - [ ] Flush chunk (must exist)
+        //       - [ ] Update previous namespace
+        //       - [ ] Reset previous key
+        //       - [ ] Create new ns_state
+        //     - [ ] Fail => Error
+        //  - [ ] Check entry key
+        //    - [ ] Previous None =>
+        //      - [ ] Set previous key
+        //    - Check strict monotonicity:
+        //      - [ ] OK => Update previous key
+        //      - [ ] Fail => Error
+        //  - [ ] Is previous chunk, if it exists, oversized => Flush chunk
+        //  - [ ] Is current chunk None => Create new chunk
+        //  - [ ] Build chunk
+        //
+        //  SclsWriter::build_chunk - namespace, key, value
+        //  - [ ] Compute entry digest
+        //  - [ ] Update chunk digest accumulator
+        //  - [ ] Add leaf to namespace Merkle tree
+        //  - [ ] Serialise entry into chunk buffer
+        //
+        //  NOTE: Finalise will have to call build_chunk to empty what's left in the buffer
+        //
+        // ChunkState::write - writer (SclsWriter.output), seqno (SclsWriter.chunk_seqno), namespace (SclsWriter.prev_namespace)
+        // OR SclsWriter::flush_chunk - chunk state [cleaner]
+        // - [ ] Discharge chunk wire format to writer
+        // - [ ] Increment chunk_seqno
+        // - [ ] Update ns_state[namespace].{chunks, entries}
+        // - [ ] Reset current_chunk to None
+        Ok(())
     }
 
     /// Finalise the SCLS output.
