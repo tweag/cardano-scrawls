@@ -113,9 +113,9 @@ pub enum SclsError {
     #[error("writer builder is missing its required slot number parameter")]
     WriterBuilderMissingSlotNo,
 
-    /// Entry attribute length overflow
-    #[error("entry key/value length overflow")]
-    EntryOverflow,
+    /// Overflow error when writing to the wire format
+    #[error("{0} length overflow in wire format")]
+    WireLengthOverflow(String),
 
     /// Inconsistent entry key lengths within a namespace
     #[error("inconsistent entry key length in {namespace}: expected {expected}, found {found}")]

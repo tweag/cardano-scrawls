@@ -5,7 +5,7 @@ use std::io::Write;
 
 use crate::error::{Result, SclsError};
 use crate::hash::{Blake2b, MerkleTree};
-use crate::records::Header;
+use crate::records::{ChunkFormat, Header, RecordType};
 
 /// Default tool name.
 pub const DEFAULT_TOOL: &str = "cardano-scrawls";
@@ -138,8 +138,8 @@ struct ChunkState {
     /// Serialised entries payload
     payload: Vec<u8>,
 
-    /// Chunk digest
-    digest: Blake2b,
+    /// Chunk digest hasher
+    hasher: Blake2b,
 
     /// Number of entries in the chunk
     entries: u32,
@@ -149,7 +149,7 @@ impl ChunkState {
     fn new() -> Self {
         Self {
             payload: Vec::new(),
-            digest: Blake2b::new_raw(),
+            hasher: Blake2b::new_raw(),
             entries: 0,
         }
     }
@@ -185,6 +185,7 @@ pub struct SclsWriter<W> {
     chunk_seqno: u64,
 
     /// Chunk state
+    // NOTE Reset this to `None` whenever a chunk is flushed
     current_chunk: Option<ChunkState>,
 
     /// Namespace state
@@ -237,17 +238,21 @@ impl<W: Write> SclsWriter<W> {
         //
         // ChunkState::write - writer (SclsWriter.output), seqno (SclsWriter.chunk_seqno), namespace (SclsWriter.prev_namespace)
         // OR SclsWriter::flush_chunk - chunk state [cleaner]
-        // - [ ] Discharge chunk wire format to writer
-        // - [ ] Increment chunk_seqno
-        // - [ ] Update ns_state[namespace].{chunks, entries}
-        // - [ ] Reset current_chunk to None
+        // - [x] Discharge chunk wire format to writer
+        // - [x] Increment chunk_seqno
+        // - [x] Update ns_state[namespace].{chunks, entries}
+        // - [x] Reset current_chunk to None
         //
-        //  NOTE: Finalise will have to call flush_chunk to empty what's left in the buffer
+        // [x] NOTE: Finalise will have to call flush_chunk to empty what's left in the buffer
 
         self.update_chunk(key, value)
     }
 
     /// Update the chunk that is currently being built with the next entry.
+    ///
+    /// Note that this _must_ be called when the necessary state is available. Namely:
+    /// [`SclsWriter::prev_namespace`], [`SclsWriter::current_chunk`] and the respective namespace
+    /// entry in [`SclsWriter::ns_state`].
     ///
     /// # Errors
     ///
@@ -282,7 +287,8 @@ impl<W: Write> SclsWriter<W> {
 
             None => {
                 // Checked truncation
-                let key_len = u32::try_from(key.len()).map_err(|_| SclsError::EntryOverflow)?;
+                let key_len = u32::try_from(key.len())
+                    .map_err(|_| SclsError::WireLengthOverflow("entry key".into()))?;
                 ns_state.key_len = Some(key_len);
             }
         };
@@ -295,16 +301,16 @@ impl<W: Write> SclsWriter<W> {
             .as_digest();
 
         // Update chunk digest and namespace Merkle tree
-        chunk.digest.update(entry_digest.as_bytes());
+        chunk.hasher.update(entry_digest.as_bytes());
         ns_state.merkle.add_leaf(entry_digest);
 
         // Serialise entry
         let entry_len = u32::try_from(
             key.len()
                 .checked_add(value.len())
-                .ok_or(SclsError::EntryOverflow)?,
+                .ok_or(SclsError::WireLengthOverflow("entry".into()))?,
         )
-        .map_err(|_| SclsError::EntryOverflow)?;
+        .map_err(|_| SclsError::WireLengthOverflow("entry".into()))?;
 
         chunk.entries += 1;
         chunk.payload.extend_from_slice(&entry_len.to_be_bytes());
@@ -314,17 +320,71 @@ impl<W: Write> SclsWriter<W> {
         Ok(())
     }
 
-    // TODO: Flush chunk
-    // len_record (4) = 1 + 8 + 1 + 4 + len_ns + 4 + len(entries) + 4 + 28
-    // type byte (1)
-    // seqno (8)
-    // format (1)
-    // len_ns (4)
-    // namespace (len_ns)
-    // len_key (4)
-    // entries payload
-    // entries_count (4)
-    // digest (28)
+    /// Discharge the current chunk buffer to the writer and update the state.
+    ///
+    /// Note that this _must_ be called when the necessary state is available. Namely:
+    /// [`SclsWriter::prev_namespace`], [`SclsWriter::current_chunk`] and the respective namespace
+    /// entry in [`SclsWriter::ns_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Wire format field overflows
+    /// - I/O failures
+    fn flush_chunk(&mut self) -> Result<()> {
+        let Some(namespace) = &self.prev_namespace else {
+            unreachable!("must only be called when the namespace is set");
+        };
+
+        // Get the current chunk state and reset it (i.e., replace it with `None`)
+        let Some(chunk) = self.current_chunk.take() else {
+            unreachable!("must only be called when the current chunk is set");
+        };
+
+        let Some(ns_state) = self.ns_state.get_mut(namespace) else {
+            unreachable!("must only be called when the namespace state is set")
+        };
+
+        let len_ns = u32::try_from(namespace.len())
+            .map_err(|_| SclsError::WireLengthOverflow("namespace".into()))?;
+        let len_key = ns_state.key_len.unwrap(); // Safe (set in update_chunk)
+        let len_entries = u32::try_from(chunk.payload.len())
+            .map_err(|_| SclsError::WireLengthOverflow("entries".into()))?;
+
+        let len_record = [
+            1,           // Type
+            8,           // Sequence number
+            1,           // Format
+            4,           // Namespace length
+            len_ns,      // Namespace
+            4,           // Entry key length
+            len_entries, // Entries payload
+            4,           // Entries count
+            28,          // Digest
+        ]
+        .iter()
+        .try_fold(0u32, |acc, &x| acc.checked_add(x))
+        .ok_or(SclsError::WireLengthOverflow("record".into()))?;
+
+        // Discharge chunk wire format
+        self.output.write_all(&len_record.to_be_bytes())?;
+        self.output.write_all(&[RecordType::Chunk.to_byte()])?;
+        self.output.write_all(&self.chunk_seqno.to_be_bytes())?;
+        self.output.write_all(&[ChunkFormat::Raw.to_byte()])?; // Compression support forthcoming
+        self.output.write_all(&len_ns.to_be_bytes())?;
+        self.output.write_all(namespace.as_bytes())?;
+        self.output.write_all(&len_key.to_be_bytes())?;
+        self.output.write_all(&chunk.payload)?;
+        self.output.write_all(&chunk.entries.to_be_bytes())?;
+        self.output.write_all(chunk.hasher.as_digest().as_bytes())?;
+
+        // Update state (recall that we already reset the chunk state earlier)
+        self.chunk_seqno += 1;
+        ns_state.chunks += 1;
+        ns_state.entries += u64::from(chunk.entries);
+
+        Ok(())
+    }
 
     /// Finalise the SCLS output.
     ///
@@ -332,7 +392,10 @@ impl<W: Write> SclsWriter<W> {
     ///
     /// Returns an error if:
     /// - TODO
-    pub fn finalise(self) -> Result<()> {
+    pub fn finalise(mut self) -> Result<()> {
+        // Discharge the final chunk to the writer
+        self.flush_chunk()?;
+
         todo!()
     }
 }
