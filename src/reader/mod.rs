@@ -3,6 +3,7 @@
 mod seq_state;
 mod verify;
 
+use std::fmt::Display;
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
@@ -112,7 +113,7 @@ impl<R: Read + Seek> SclsReader<R> {
             };
         }
 
-        sequence.update(&Record::Eof)
+        sequence.finalise()
     }
 }
 
@@ -136,9 +137,6 @@ pub enum Record {
 
     /// Unknown record (can be safely skipped)
     Unknown { record_type: u8, data: Vec<u8> },
-
-    /// A dummy entry that doesn't map to an SCLS record, but demarcates the end of the file
-    Eof,
 }
 
 impl Record {
@@ -236,6 +234,18 @@ impl Record {
                 record_type,
                 data: data.to_vec(),
             }),
+        }
+    }
+}
+
+// This is just a nice-to-have for state machine errors
+impl Display for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Header(_) => write!(f, "HDR"),
+            Self::Chunk(_) => write!(f, "CHUNK"),
+            Self::Manifest(_) => write!(f, "MANIFEST"),
+            Self::Unknown { record_type, .. } => write!(f, "UNKNOWN 0x{:02x}", record_type),
         }
     }
 }

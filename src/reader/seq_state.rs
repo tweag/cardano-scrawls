@@ -7,14 +7,31 @@
 //! HDR CHUNK* MANIFEST
 //! ```
 
+use std::fmt::Display;
+
 use super::Record;
 use crate::error::{Result, SclsError};
 
 /// Record sequence state machine expectation states.
+#[derive(PartialEq, Eq)]
 enum Expect {
     Header,
     ChunkOrManifest,
     Eof,
+}
+
+impl Display for Expect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Header => "HDR",
+                Self::ChunkOrManifest => "CHUNK or MANIFEST",
+                Self::Eof => "end of file",
+            }
+        )
+    }
 }
 
 /// SCLS record sequence state machine.
@@ -28,31 +45,25 @@ impl RecordSequence {
 
     /// Update the record sequence state machine with the next consumed record type.
     ///
-    /// Note that unknown records will be skipped over, for now. This may change in a future
+    /// Note that unknown records will be skipped over, for now. This _may_ change in a future
     /// release.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The next record is unexpected
-    /// - The end of the file is reached unexpectedly
-    pub fn update(&mut self, next: &Record) -> Result<()> {
-        match (&self.0, next) {
+    /// Returns an error if the next record is unexpected.
+    pub fn update(&mut self, state: &Record) -> Result<()> {
+        let expected = &self.0;
+
+        match (&expected, state) {
             // Skip unknown records (for now)
             (_, Record::Unknown { .. }) => {}
 
             (Expect::Header, Record::Header(_)) => self.0 = Expect::ChunkOrManifest,
 
-            (Expect::Header, Record::Eof) => {
-                return Err(SclsError::UnexpectedEof {
-                    expected: "HEADER".into(),
-                });
-            }
-
             (Expect::Header, record) => {
                 return Err(SclsError::UnexpectedRecord {
-                    expected: "HEADER".into(),
-                    found: name(record),
+                    expected: expected.to_string(),
+                    found: record.to_string(),
                 });
             }
 
@@ -60,28 +71,35 @@ impl RecordSequence {
 
             (Expect::ChunkOrManifest, Record::Manifest(_)) => self.0 = Expect::Eof,
 
-            (Expect::ChunkOrManifest, Record::Eof) => {
-                return Err(SclsError::UnexpectedEof {
-                    expected: "CHUNK or MANIFEST".into(),
-                });
-            }
-
             (Expect::ChunkOrManifest, record) => {
                 return Err(SclsError::UnexpectedRecord {
-                    expected: "CHUNK or MANIFEST".into(),
-                    found: name(record),
+                    expected: expected.to_string(),
+                    found: record.to_string(),
                 });
             }
-
-            (Expect::Eof, Record::Eof) => {}
 
             (Expect::Eof, record) => {
                 return Err(SclsError::UnexpectedRecord {
-                    expected: "EOF".into(),
-                    found: name(record),
+                    expected: expected.to_string(),
+                    found: record.to_string(),
                 });
             }
         };
+
+        Ok(())
+    }
+
+    /// Terminate the state machine.
+    ///
+    /// # Errors
+    ///
+    /// Return an error if the end of the file is reached unexpectedly.
+    pub fn finalise(&self) -> Result<()> {
+        if self.0 != Expect::Eof {
+            return Err(SclsError::UnexpectedEof {
+                expected: self.0.to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -93,21 +111,9 @@ impl Default for RecordSequence {
     }
 }
 
-/// Simple record naming stringification.
-fn name(record: &Record) -> String {
-    match record {
-        Record::Header(_) => "HEADER".into(),
-        Record::Chunk(_) => "CHUNK".into(),
-        Record::Manifest(_) => "MANIFEST".into(),
-        Record::Unknown { record_type, .. } => format!("UNKNOWN 0x{record_type:02x}"),
-        Record::Eof => "EOF".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::iter;
     use std::sync::LazyLock;
 
     use proptest::prelude::*;
@@ -157,11 +163,11 @@ mod tests {
     /// Strategy for generating valid record sequences.
     fn valid_sequence() -> impl Strategy<Value = Vec<Record>> {
         let chunk = &*DUMMY_CHUNK;
+
         prop::collection::vec(Just(chunk.clone()), 0..=5).prop_map(|chunks| {
             let mut seq = vec![DUMMY_HEADER];
             seq.extend(chunks);
             seq.push(DUMMY_MANIFEST);
-            seq.push(Record::Eof);
             seq
         })
     }
@@ -177,14 +183,13 @@ mod tests {
                     record_type: 0xff,
                     data: vec![],
                 },
-                Record::Eof,
             ]),
             0..=10,
         )
         .prop_filter("sequence must be invalid", |seq| {
             let mut sequence = RecordSequence::new();
             seq.iter().any(|record| sequence.update(record).is_err())
-                || sequence.update(&Record::Eof).is_err()
+                || sequence.finalise().is_err()
         })
     }
 
@@ -192,36 +197,30 @@ mod tests {
         #[test]
         fn valid_record_sequence(records in valid_sequence()) {
             let mut sequence = RecordSequence::new();
+
             for record in records {
                 prop_assert!(sequence.update(&record).is_ok());
             }
+            prop_assert!(sequence.finalise().is_ok());
         }
 
         #[test]
         fn invalid_record_sequence(records in invalid_sequence()) {
             let mut sequence = RecordSequence::new();
-            let mut current: Option<&Record> = None;
 
             let status = records
                 .iter()
-                .chain(iter::once(&Record::Eof)) // Always ensure there's an EOF
-                .try_for_each(|record| {
-                    current = Some(record);
-                    sequence.update(record)
-                });
+                .try_for_each(|record| sequence.update(record));
 
             match status {
-                Err(SclsError::UnexpectedEof { .. }) => {
-                    prop_assert_eq!(current, Some(&Record::Eof))
-                }
+                // If the record sequence is fine, check finalisation correctly fails
+                Ok(()) => prop_assert!(sequence.finalise().is_err()),
 
-                Err(SclsError::UnexpectedRecord { .. }) => {
-                    prop_assert_ne!(current, Some(&Record::Eof))
-                }
+                // Out of order records are expected
+                Err(SclsError::UnexpectedRecord { .. }) => {}
 
-                // These should never happen
+                // This should never happen
                 Err(e) => prop_assert!(false, "unexpected error: {e}"),
-                Ok(()) => prop_assert!(false, "invalid sequence passed"),
             }
         }
     }
