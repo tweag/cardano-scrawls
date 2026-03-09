@@ -28,7 +28,8 @@ impl RecordSequence {
 
     /// Update the record sequence state machine with the next consumed record type.
     ///
-    /// Note that unknown records will be skipped over.
+    /// Note that unknown records will be skipped over, for now. This may change in a future
+    /// release.
     ///
     /// # Errors
     ///
@@ -37,7 +38,7 @@ impl RecordSequence {
     /// - The end of the file is reached unexpectedly
     pub fn update(&mut self, next: &Record) -> Result<()> {
         match (&self.0, next) {
-            // Skip unknown records
+            // Skip unknown records (for now)
             (_, Record::Unknown { .. }) => {}
 
             (Expect::Header, Record::Header(_)) => self.0 = Expect::ChunkOrManifest,
@@ -98,8 +99,6 @@ fn name(record: &Record) -> String {
         Record::Header(_) => "HEADER".into(),
         Record::Chunk(_) => "CHUNK".into(),
         Record::Manifest(_) => "MANIFEST".into(),
-
-        // These should never happen
         Record::Unknown { record_type, .. } => format!("UNKNOWN 0x{record_type:02x}"),
         Record::Eof => "EOF".into(),
     }
