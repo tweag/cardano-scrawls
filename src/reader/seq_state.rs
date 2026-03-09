@@ -54,7 +54,7 @@ impl RecordSequence {
     pub fn update(&mut self, state: &Record) -> Result<()> {
         let expected = &self.0;
 
-        match (&expected, state) {
+        match (expected, state) {
             // Skip unknown records (for now)
             (_, Record::Unknown { .. }) => {}
 
