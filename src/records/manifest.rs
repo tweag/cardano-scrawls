@@ -3,7 +3,7 @@
 use std::str;
 
 use crate::error::{Result, SclsError};
-use crate::types::digest::{Digest, HASH_SIZE};
+use crate::hash::{Digest, HASH_SIZE};
 
 /// The manifest record (record type 0x01) containing file metadata and integrity information.
 #[derive(Debug, Clone, PartialEq, Eq)]

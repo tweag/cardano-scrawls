@@ -1,15 +1,12 @@
 pub mod chunk;
-pub mod digest;
 pub mod header;
 pub mod manifest;
-pub mod merkle;
 
 use crate::error::SclsError;
+
 pub use chunk::{Chunk, ChunkFooter, ChunkFormat, Entry};
-pub use digest::Digest;
 pub use header::Header;
 pub use manifest::{Manifest, NamespaceInfo, Summary};
-pub use merkle::MerkleTree;
 
 /// Record type identifiers for SCLS records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

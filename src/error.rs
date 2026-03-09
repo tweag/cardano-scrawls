@@ -1,6 +1,6 @@
 //! Error types for SCLS parsing and validation.
 
-use crate::types::Digest;
+use crate::hash::Digest;
 
 use thiserror::Error;
 
