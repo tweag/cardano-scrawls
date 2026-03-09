@@ -433,3 +433,214 @@ impl<W: Write> SclsWriter<W> {
         todo!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::reader::Record;
+    use crate::records::Entry;
+
+    use proptest::prelude::*;
+
+    #[test]
+    fn accept_same_namespace() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("test", b"a", b"a").is_ok());
+        assert!(writer.write_entry("test", b"b", b"a").is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn accept_monotonic_namespace() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("a", b"a", b"a").is_ok());
+        assert!(writer.write_entry("b", b"a", b"a").is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn forbid_decreasing_namespace() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("b", b"a", b"a").is_ok());
+        let Err(err) = writer.write_entry("a", b"a", b"a") else {
+            panic!("descending namespace should be forbidden")
+        };
+
+        assert!(matches!(err, SclsError::NonMonotonicNamespace { .. }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn forbid_previous_namespace() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("a", b"a", b"a").is_ok());
+        assert!(writer.write_entry("b", b"a", b"a").is_ok());
+        let Err(err) = writer.write_entry("a", b"b", b"a") else {
+            panic!("descending namespace should be forbidden");
+        };
+
+        assert!(matches!(err, SclsError::NonMonotonicNamespace { .. }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn accept_strictly_increasing_keys() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("a", b"a", b"a").is_ok());
+        assert!(writer.write_entry("a", b"b", b"a").is_ok());
+        assert!(writer.write_entry("b", b"a", b"a").is_ok());
+        assert!(writer.write_entry("b", b"b", b"a").is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn forbid_equal_keys() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("test", b"a", b"a").is_ok());
+        assert!(matches!(
+            writer.write_entry("test", b"a", b"a"),
+            Err(SclsError::NonStrictlyMonotonicKeys { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn forbid_decreasing_keys() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("test", b"b", b"a").is_ok());
+        assert!(matches!(
+            writer.write_entry("test", b"a", b"a"),
+            Err(SclsError::NonStrictlyMonotonicKeys { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn key_order_resets_with_namespace() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("a", b"b", b"a").is_ok());
+        assert!(writer.write_entry("b", b"a", b"a").is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn forbid_inconsistent_key_length_within_namespace() -> Result<()> {
+        let buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(buf).slot_no(0).build()?;
+
+        assert!(writer.write_entry("test", b"a", b"a").is_ok());
+        assert!(matches!(
+            writer.write_entry("test", b"foo", b"a"),
+            Err(SclsError::InconsistentKeyLength { .. })
+        ));
+
+        Ok(())
+    }
+
+    // Strategy to generate valid (namespace, key, entry) sequences
+    prop_compose! {
+        fn valid_entry_writes()
+            (
+                // (Namespace, entry key) pairs will be correctly ordered in a BTreeSet.
+                // The entry key is limited to one byte to side-step the fixed key length per
+                // namespace constraint.
+                pairs in proptest::collection::btree_set(("[a-z]+", any::<u8>()), 1..=20),
+            )
+            (
+                values in proptest::collection::vec(
+                    proptest::collection::vec(any::<u8>(), 0..=16usize),
+                    pairs.len()..=pairs.len(),
+                ),
+                pairs in Just(pairs),
+            )
+        -> Vec<(String, Vec<u8>, Vec<u8>)> {
+            pairs.into_iter()
+                .zip(values)
+                .map(|((ns, key), value)| (ns, vec![key], value))
+                .collect()
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn chunk_roundtrip(entries in valid_entry_writes()) {
+            let mut buf = Vec::new();
+            let mut writer = SclsWriter::builder().output(&mut buf).slot_no(0).build()?;
+
+            let mut written_by_ns: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
+            let mut read_by_ns: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
+
+            for (namespace, key, value) in &entries {
+                // Group entries by namespace (correctly ordered)
+                written_by_ns.entry(namespace.clone())
+                    .or_default()
+                    .push(Entry { key: key.clone(), value: value.clone() });
+
+                writer.write_entry(namespace.as_str(), key, value)?;
+            }
+
+            // Flush the last chunk with a dummy namespace which is guaranteed to be monotonic (the
+            // strategy generates namespaces that match /[a-z]+/ and CJK characters are way beyond
+            // that range in Unicode). The chunk with this entry will never be flushed, by design.
+            writer.write_entry("最终", b"a", b"a")?;
+
+            let mut cursor = Cursor::new(buf.clone());
+            let header_first = matches!(Record::read_next(&mut cursor)?, Some(Record::Header(_)));
+            prop_assert!(header_first);
+
+            let mut seqno = 0;
+
+            while let Some(Record::Chunk(chunk)) = Record::read_next(&mut cursor)? {
+                let mut cursor = Cursor::new(buf.clone());
+
+                // Check ascending sequence number
+                prop_assert_eq!(chunk.seqno, seqno);
+                seqno += 1;
+
+                // Verify chunk digest
+                prop_assert!(chunk.verify(&mut cursor).is_ok());
+
+                // Build up entries by namespace
+                chunk.for_each_entry(&mut cursor, |reader, key_len, val_len| {
+                    let namespace = chunk.namespace.clone();
+                    let entry = Entry::materialise(reader, key_len, val_len)?;
+
+                    read_by_ns.entry(namespace)
+                        .or_default()
+                        .push(entry);
+
+                    Ok(())
+                })?;
+            }
+
+            // Check namespace entries match
+            prop_assert_eq!(read_by_ns, written_by_ns);
+        }
+    }
+}
