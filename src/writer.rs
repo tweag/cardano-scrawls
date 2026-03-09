@@ -1,5 +1,6 @@
 //! SCLS file writing.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -206,44 +207,75 @@ impl<W: Write> SclsWriter<W> {
     /// - The namespace is not the same or bytewise ascending from previously written namespaces
     /// - The entry key is not strictly lexicographically monotonic for previously written entry
     ///   keys in the given namespace
-    /// - TODO
+    /// - The entry, its key or its value has length greater than 2^32 bytes
+    /// - Entry key length is inconsistent within the same namespace
+    /// - Wire format field overflows
+    /// - I/O failures
     pub fn write_entry(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<()> {
-        // SclsWriter::write_entry - namespace, key, value
-        // - [ ] Check namespace:
-        //   - [ ] Previous None =>
-        //     - [ ] Set previous namespace
-        //     - [ ] Create new ns_state
-        //   - [ ] Check monotonicity if changed:
-        //     - [ ] OK =>
-        //       - [ ] Flush chunk (must exist)
-        //       - [ ] Update previous namespace
-        //       - [ ] Reset previous key
-        //       - [ ] Create new ns_state
-        //     - [ ] Fail => Error
-        // - [ ] Check entry key
-        //   - [ ] Previous None =>
-        //     - [ ] Set previous key
-        //   - Check strict monotonicity:
-        //     - [ ] OK => Update previous key
-        //     - [ ] Fail => Error
-        // - [ ] Is previous chunk, if it exists, oversized => Flush chunk
-        // - [ ] Is current chunk None => Create new chunk
-        // - [x] Update chunk
-        //
-        // SclsWriter::update_chunk - namespace, key, value
-        // - [x] Compute entry digest
-        // - [x] Update chunk digest accumulator
-        // - [x] Add leaf to namespace Merkle tree
-        // - [x] Serialise entry into chunk buffer
-        //
-        // ChunkState::write - writer (SclsWriter.output), seqno (SclsWriter.chunk_seqno), namespace (SclsWriter.prev_namespace)
-        // OR SclsWriter::flush_chunk - chunk state [cleaner]
-        // - [x] Discharge chunk wire format to writer
-        // - [x] Increment chunk_seqno
-        // - [x] Update ns_state[namespace].{chunks, entries}
-        // - [x] Reset current_chunk to None
-        //
-        // [x] NOTE: Finalise will have to call flush_chunk to empty what's left in the buffer
+        // Check and update (if necessary) namespace state
+        match &self.prev_namespace {
+            None => {
+                self.prev_namespace = Some(namespace.to_string());
+                self.ns_state
+                    .insert(namespace.to_string(), NamespaceState::new());
+            }
+
+            Some(prev_namespace) => {
+                let order = prev_namespace.as_str().cmp(namespace);
+                match order {
+                    // No namespace change: nothing to do
+                    Ordering::Equal => {}
+
+                    // New namespace is monotonically increasing: flush chunk and reset state
+                    Ordering::Less => {
+                        self.flush_chunk()?;
+                        self.prev_namespace = Some(namespace.to_string());
+                        self.prev_ns_entry_key = None;
+                        self.ns_state
+                            .insert(namespace.to_string(), NamespaceState::new());
+                    }
+
+                    // Non-monotonic namespace
+                    Ordering::Greater => {
+                        return Err(SclsError::NonMonotonicNamespace {
+                            previous: prev_namespace.clone(),
+                            found: namespace.to_string(),
+                        });
+                    }
+                };
+            }
+        }
+
+        // Check and update (if necessary) key entry state
+        match &self.prev_ns_entry_key {
+            None => {
+                self.prev_ns_entry_key = Some(key.to_vec());
+            }
+
+            Some(prev_key) => {
+                // Strict monotonicity check
+                if prev_key.as_slice() >= key {
+                    return Err(SclsError::NonStrictlyMonotonicKeys {
+                        namespace: namespace.to_string(),
+                    });
+                }
+
+                self.prev_ns_entry_key = Some(key.to_vec());
+            }
+        }
+
+        // Flush any existing chunk that's reached the size limit
+        // Note that this resets the current chunk (see SclsWriter::flush_chunk)
+        if let Some(chunk) = &self.current_chunk
+            && chunk.payload.len() >= self.max_chunk_size
+        {
+            self.flush_chunk()?;
+        }
+
+        // Create a new chunk, if required
+        if self.current_chunk.is_none() {
+            self.current_chunk = Some(ChunkState::new());
+        }
 
         self.update_chunk(key, value)
     }
@@ -393,8 +425,10 @@ impl<W: Write> SclsWriter<W> {
     /// Returns an error if:
     /// - TODO
     pub fn finalise(mut self) -> Result<()> {
-        // Discharge the final chunk to the writer
-        self.flush_chunk()?;
+        // Discharge the final chunk, if there is one, to the writer
+        if self.current_chunk.is_some() {
+            self.flush_chunk()?;
+        }
 
         todo!()
     }

@@ -124,6 +124,20 @@ pub enum SclsError {
         expected: usize,
         found: usize,
     },
+
+    /// Attempted to write non-monotonic namespace
+    ///
+    /// Note, this is effectively equivalent to [`SclsError::NamespaceDisordered`]. We maintain the
+    /// distinction because they occur under semantically distinct operations.
+    #[error("Namespaces are not in bytewise order: previous \"{previous}\", found \"{found}\"")]
+    NonMonotonicNamespace { previous: String, found: String },
+
+    /// Attempted to write non-strictly monotonic entry key
+    ///
+    /// Note, this is similar to [`SclsError::KeysDisordered`]. We maintain the distinction because
+    /// they occur under semantically distinct operations.
+    #[error("Entry keys are not strictly lexicographically increasing in {namespace}")]
+    NonStrictlyMonotonicKeys { namespace: String },
 }
 
 /// Convenience type alias for Results with SclsError.
