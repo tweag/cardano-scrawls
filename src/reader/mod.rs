@@ -1,12 +1,15 @@
 //! SCLS file reader and record parsing.
 
+mod seq_state;
 mod verify;
 
+use std::fmt::Display;
 use std::io::{Read, Seek};
 
 use crate::error::{Result, SclsError};
 use crate::records::{Chunk, Header, Manifest, RecordType};
 
+use seq_state::RecordSequence;
 use verify::VerifyState;
 pub use verify::{CheckStructure, VerifyOptions};
 
@@ -52,6 +55,7 @@ impl<R: Read + Seek> SclsReader<R> {
     ///
     /// Returns an error if:
     /// - An I/O or parse error occurs
+    /// - The record sequence does not meet expectations
     /// - Chunk sequence numbers are not strictly increasing
     /// - Chunk namespaces are not in bytewise ascending order
     /// - Entry keys are not in ascending order within a namespace
@@ -74,7 +78,11 @@ impl<R: Read + Seek> SclsReader<R> {
             self.reader.seek(std::io::SeekFrom::Start(0))?;
         }
 
+        let mut sequence = RecordSequence::new();
+
         while let Some(record) = Record::read_next(&mut self.reader)? {
+            sequence.update(&record)?;
+
             match record {
                 Record::Chunk(chunk) => {
                     if options.check_structure.enabled() {
@@ -105,10 +113,7 @@ impl<R: Read + Seek> SclsReader<R> {
             };
         }
 
-        // TODO We don't currently check the input's record sequence structure, which is important
-        // (e.g., with `check_integrity` but no manifest, the input will validate). This will be
-        // resolved in a subsequent PR.
-        Ok(())
+        sequence.finalise()
     }
 }
 
@@ -119,7 +124,7 @@ pub struct RecordIter<'a, R> {
 }
 
 /// A parsed record from an SCLS file.
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Record {
     /// File header
     Header(Header),
@@ -233,6 +238,18 @@ impl Record {
     }
 }
 
+// This is just a nice-to-have for state machine errors
+impl Display for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Header(_) => write!(f, "HDR"),
+            Self::Chunk(_) => write!(f, "CHUNK"),
+            Self::Manifest(_) => write!(f, "MANIFEST"),
+            Self::Unknown { record_type, .. } => write!(f, "UNKNOWN 0x{:02x}", record_type),
+        }
+    }
+}
+
 impl<'a, R: Read + Seek> Iterator for RecordIter<'a, R> {
     type Item = Result<Record>;
 
@@ -273,7 +290,7 @@ mod tests {
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/minimal-raw.scls");
 
     /// Fixture ranges extracted from the [Kaitai IDE](https://ide.kaitai.io), using the Kaitai
-    /// specification defined in [CIP-0165](https://github.com/tweag/CIPs/tree/cip-canonical/CIP-0165)
+    /// specification defined in [CIP-0165](https://github.com/cardano-foundation/CIPs/tree/master/CIP-0165)
     const HEADER_VERSION: RangeInclusive<usize> = 0x9..=0xc;
     const CHUNK_SEQ_NO: RangeInclusive<usize> = 0x12..=0x19;
     const CHUNK_NAMESPACE: RangeInclusive<usize> = 0x1f..=0x27;
