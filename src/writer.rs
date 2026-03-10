@@ -118,7 +118,7 @@ struct NamespaceState {
     /// Number of entries in the namespace
     entries: u64,
 
-    /// Merkle tree for namespace
+    /// Merkle tree fornamespace
     merkle: MerkleTree,
 }
 
@@ -559,6 +559,67 @@ mod tests {
             writer.write_entry("test", b"foo", b"a"),
             Err(SclsError::InconsistentKeyLength { .. })
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_size_below_threshold() -> Result<()> {
+        let mut buf = Vec::new();
+        let mut writer = SclsWriter::builder()
+            .output(&mut buf)
+            .slot_no(0)
+            .max_chunk_size(12)
+            .build()?;
+
+        // Entry length: len_body(4) + key(1) + value(1) = 6 bytes
+        writer.write_entry("test", b"a", b"a")?; // +6 bytes
+        writer.write_entry("test", b"b", b"a")?; // +6 bytes
+
+        // At threshold, no chunk should have been written
+        let mut cursor = Cursor::new(buf.clone());
+        assert!(matches!(
+            Record::read_next(&mut cursor)?,
+            Some(Record::Header(_))
+        ));
+        assert!(Record::read_next(&mut cursor)?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_size_above_threshold() -> Result<()> {
+        let key = b"a";
+        let value = b"this is an oversized entry";
+
+        let mut buf = Vec::new();
+        let mut writer = SclsWriter::builder()
+            .output(&mut buf)
+            .slot_no(0)
+            .max_chunk_size(12)
+            .build()?;
+
+        writer.write_entry("test", key, value)?; // +31 bytes
+        writer.write_entry("test", b"b", b"a")?; // +6 bytes (to force flush)
+
+        // We should have one chunk with the oversized record
+        let mut cursor = Cursor::new(buf.clone());
+        assert!(matches!(
+            Record::read_next(&mut cursor)?,
+            Some(Record::Header(_))
+        ));
+        let Some(Record::Chunk(chunk)) = Record::read_next(&mut cursor)? else {
+            panic!("expected chunk");
+        };
+        assert!(Record::read_next(&mut cursor)?.is_none());
+
+        chunk.for_each_entry(&mut cursor, |reader, key_len, val_len| {
+            let entry = Entry::materialise(reader, key_len, val_len)?;
+            assert_eq!(entry.key, key);
+            assert_eq!(entry.value, value);
+
+            Ok(())
+        })?;
 
         Ok(())
     }
