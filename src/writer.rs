@@ -4,9 +4,11 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use chrono::{SecondsFormat, Utc};
+
 use crate::error::{Result, SclsError};
-use crate::hash::{Blake2b, MerkleTree};
-use crate::records::{ChunkFormat, Header, RecordType};
+use crate::hash::{Blake2b, HASH_SIZE, MerkleTree};
+use crate::records::{ChunkFormat, Header, Manifest, NamespaceInfo, RecordType, Summary};
 
 /// Default tool name.
 pub const DEFAULT_TOOL: &str = "cardano-scrawls";
@@ -118,7 +120,7 @@ struct NamespaceState {
     /// Number of entries in the namespace
     entries: u64,
 
-    /// Merkle tree fornamespace
+    /// Merkle tree for namespace
     merkle: MerkleTree,
 }
 
@@ -381,15 +383,15 @@ impl<W: Write> SclsWriter<W> {
             .map_err(|_| SclsError::WireLengthOverflow("entries".into()))?;
 
         let len_record = [
-            1,           // Type
-            8,           // Sequence number
-            1,           // Format
-            4,           // Namespace length
-            len_ns,      // Namespace
-            4,           // Entry key length
-            len_entries, // Entries payload
-            4,           // Entries count
-            28,          // Digest
+            1,                // Type
+            8,                // Sequence number
+            1,                // Format
+            4,                // Namespace length
+            len_ns,           // Namespace
+            4,                // Entry key length
+            len_entries,      // Entries payload
+            4,                // Entries count
+            HASH_SIZE as u32, // Digest
         ]
         .iter()
         .try_fold(0u32, |acc, &x| acc.checked_add(x))
@@ -420,14 +422,85 @@ impl<W: Write> SclsWriter<W> {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - TODO
+    /// - Wire format field overflows
+    /// - I/O failures
     pub fn finalise(mut self) -> Result<()> {
         // Discharge the final chunk, if there is one, to the writer
         if self.current_chunk.is_some() {
             self.flush_chunk()?;
         }
 
-        todo!()
+        let mut global_digest = MerkleTree::new();
+        let mut namespace_info = Vec::new();
+        let mut total_entries = 0u64;
+        let mut total_chunks = 0u64;
+        let mut ns_info_len = 0usize;
+
+        // Compute manifest state
+        for (namespace, info) in self.ns_state {
+            let ns_digest = info.merkle.root();
+            let ns_leaf = Blake2b::new_leaf().update(ns_digest.as_bytes()).as_digest();
+
+            // Update global Merkle tree
+            global_digest.add_leaf(ns_leaf);
+
+            total_entries += info.entries;
+            total_chunks += info.chunks;
+
+            // Namespace info wire length:
+            // len_ns(4) + entries(8) + chunks(8) + namespace(len_ns) + digest(HASH_SIZE)
+            ns_info_len += 4 + 8 + 8 + namespace.len() + HASH_SIZE;
+
+            namespace_info.push(NamespaceInfo {
+                entries_count: info.entries,
+                chunks_count: info.chunks,
+                name: namespace,
+                digest: ns_digest,
+            });
+        }
+
+        // Current UTC timestamp in RFC 3339 format, with second resolution and Zulu time zone
+        let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+
+        // A rather nice property of the manifest record is that its offset field is the same as
+        // the payload length on the wire, so it's bookended by the same value.
+        let offset = u32::try_from(
+            [
+                1,                                                // Type
+                8,                                                // Slot number
+                8,                                                // Total entries
+                8,                                                // Total chunks
+                4 + created_at.len(),                             // Summary: created at
+                4 + self.tool.len(),                              // Summary: tool
+                4 + self.comment.as_ref().map_or(0, |s| s.len()), // Summary: comment
+                ns_info_len,                                      // Namespace info
+                4,                                                // ns_info terminal sentinel
+                8,                                                // Previous manifest
+                HASH_SIZE,                                        // Global hash
+                4,                                                // Offset
+            ]
+            .iter()
+            .try_fold(0usize, |acc, &x| acc.checked_add(x))
+            .ok_or(SclsError::WireLengthOverflow("manifest offset".into()))?,
+        )
+        .map_err(|_| SclsError::WireLengthOverflow("manifest offset".into()))?;
+
+        let manifest = Manifest {
+            slot_no: self.slot_no,
+            total_entries,
+            total_chunks,
+            root_hash: global_digest.root(),
+            namespace_info,
+            prev_manifest: 0,
+            summary: Summary {
+                created_at,
+                tool: self.tool,
+                comment: self.comment,
+            },
+            offset,
+        };
+
+        manifest.write(&mut self.output)
     }
 }
 
