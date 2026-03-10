@@ -1,9 +1,11 @@
 //! SCLS manifest record.
 
+use std::io::Write;
 use std::str;
 
 use crate::error::{Result, SclsError};
 use crate::hash::{Digest, HASH_SIZE};
+use crate::records::RecordType;
 
 /// The manifest record (record type 0x01) containing file metadata and integrity information.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,35 @@ pub struct NamespaceInfo {
 
     /// Merkle root of all live entries in this namespace
     pub digest: Digest,
+}
+
+impl Manifest {
+    /// Write the manifest record to the writer stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is an I/O failure.
+    pub fn write(&self, writer: &mut impl Write) -> Result<()> {
+        // Record length is the same as the offset
+        writer.write_all(&self.offset.to_be_bytes())?;
+
+        writer.write_all(&[RecordType::Manifest.to_byte()])?;
+        writer.write_all(&self.slot_no.to_be_bytes())?;
+        writer.write_all(&self.total_entries.to_be_bytes())?;
+        writer.write_all(&self.total_chunks.to_be_bytes())?;
+        writer.write_all(&self.summary.to_bytes()?)?;
+
+        for ns_info in &self.namespace_info {
+            writer.write_all(&ns_info.to_bytes()?)?;
+        }
+        writer.write_all(&0u32.to_be_bytes())?; // sentinel
+
+        writer.write_all(&self.prev_manifest.to_be_bytes())?;
+        writer.write_all(self.root_hash.as_bytes())?;
+        writer.write_all(&self.offset.to_be_bytes())?;
+
+        Ok(())
+    }
 }
 
 impl NamespaceInfo {
@@ -113,6 +144,22 @@ impl NamespaceInfo {
 
         Ok((namespaces, pos))
     }
+
+    /// Return the wire serialisation of the namespace info.
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        let len_ns = u32::try_from(self.name.len())
+            .map_err(|_| SclsError::WireLengthOverflow("namespace length".into()))?;
+
+        buf.extend_from_slice(&len_ns.to_be_bytes());
+        buf.extend_from_slice(&self.entries_count.to_be_bytes());
+        buf.extend_from_slice(&self.chunks_count.to_be_bytes());
+        buf.extend_from_slice(self.name.as_bytes());
+        buf.extend_from_slice(self.digest.as_bytes());
+
+        Ok(buf)
+    }
 }
 
 /// Summary metadata about file creation.
@@ -157,6 +204,15 @@ impl Summary {
             },
             pos,
         ))
+    }
+
+    /// Return the wire serialisation of the summary.
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf = to_tstr_bytes(&self.created_at)?;
+        buf.extend(to_tstr_bytes(&self.tool)?);
+        buf.extend(to_tstr_bytes(self.comment.as_deref().unwrap_or(""))?);
+
+        Ok(buf)
     }
 }
 
@@ -267,6 +323,21 @@ fn parse_tstr(data: &[u8]) -> Result<(String, usize)> {
         .to_string();
 
     Ok((s, total_len))
+}
+
+/// Convert an AsRef<str> into a length-prefixed UTF-8 string (`tstr` in the Kaitai spec).
+///
+/// # Errors
+///
+/// Returns an error if there's a length overflow
+fn to_tstr_bytes<S: AsRef<str>>(input: S) -> Result<Vec<u8>> {
+    let len = u32::try_from(input.as_ref().len())
+        .map_err(|_| SclsError::WireLengthOverflow("tstr".into()))?;
+
+    let mut buf = len.to_be_bytes().to_vec();
+    buf.extend_from_slice(input.as_ref().as_bytes());
+
+    Ok(buf)
 }
 
 #[cfg(test)]
