@@ -246,22 +246,13 @@ impl<W: Write> SclsWriter<W> {
             }
         }
 
-        // Check and update (if necessary) key entry state
-        match &self.prev_ns_entry_key {
-            None => {
-                self.prev_ns_entry_key = Some(key.to_vec());
-            }
-
-            Some(prev_key) => {
-                // Strict monotonicity check
-                if prev_key.as_slice() >= key {
-                    return Err(SclsError::NonStrictlyMonotonicKeys {
-                        namespace: namespace.to_string(),
-                    });
-                }
-
-                self.prev_ns_entry_key = Some(key.to_vec());
-            }
+        // Check key monotonicity (without updating state yet)
+        if let Some(prev_key) = &self.prev_ns_entry_key
+            && prev_key.as_slice() >= key
+        {
+            return Err(SclsError::NonStrictlyMonotonicKeys {
+                namespace: namespace.to_string(),
+            });
         }
 
         // Flush any existing chunk that's reached the size limit
@@ -277,7 +268,12 @@ impl<W: Write> SclsWriter<W> {
             self.current_chunk = Some(ChunkState::new());
         }
 
-        self.update_chunk(key, value)
+        self.update_chunk(key, value)?;
+
+        // Only advance key state after successful write
+        self.prev_ns_entry_key = Some(key.to_vec());
+
+        Ok(())
     }
 
     /// Update the chunk that is currently being built with the next entry.
@@ -325,6 +321,14 @@ impl<W: Write> SclsWriter<W> {
             }
         };
 
+        // Compute and check entry length
+        let entry_len = u32::try_from(
+            key.len()
+                .checked_add(value.len())
+                .ok_or(SclsError::WireLengthOverflow("entry".into()))?,
+        )
+        .map_err(|_| SclsError::WireLengthOverflow("entry".into()))?;
+
         // Compute entry digest
         let entry_digest = Blake2b::new_leaf()
             .update(namespace.as_bytes())
@@ -337,13 +341,6 @@ impl<W: Write> SclsWriter<W> {
         ns_state.merkle.add_leaf(entry_digest);
 
         // Serialise entry
-        let entry_len = u32::try_from(
-            key.len()
-                .checked_add(value.len())
-                .ok_or(SclsError::WireLengthOverflow("entry".into()))?,
-        )
-        .map_err(|_| SclsError::WireLengthOverflow("entry".into()))?;
-
         chunk.entries += 1;
         chunk.payload.extend_from_slice(&entry_len.to_be_bytes());
         chunk.payload.extend_from_slice(key);
