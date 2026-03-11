@@ -1,5 +1,8 @@
 //! SCLS file header record.
 
+use std::io::Write;
+
+use super::RecordType;
 use crate::error::{Result, SclsError};
 
 /// The SCLS file header (record type 0x00)
@@ -31,6 +34,22 @@ impl Header {
     /// Checks if this version is supported for reading.
     pub fn is_supported(&self) -> bool {
         self.version == Self::CURRENT_VERSION // For now
+    }
+
+    /// Write the header record to the writer stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is an I/O failure.
+    pub fn write(&self, writer: &mut impl Write) -> Result<()> {
+        // Record length: type(1) + magic(4) + version(4) = 9 bytes
+        writer.write_all(&9u32.to_be_bytes())?;
+
+        writer.write_all(&[RecordType::Header.to_byte()])?;
+        writer.write_all(Self::MAGIC)?;
+        writer.write_all(&self.version.to_be_bytes())?;
+
+        Ok(())
     }
 }
 
@@ -72,9 +91,12 @@ impl TryFrom<&[u8]> for Header {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use proptest::prelude::*;
 
     use super::*;
+    use crate::reader::Record;
 
     proptest! {
         #[test]
@@ -111,5 +133,22 @@ mod tests {
             prop_assert!(result.is_ok());
             prop_assert_eq!(result.unwrap().version, version);
         }
+    }
+
+    #[test]
+    fn roundtrip() -> Result<()> {
+        let mut sink: Vec<u8> = Vec::new();
+
+        let written = Header::current();
+        written.write(&mut sink)?;
+
+        let mut source = Cursor::new(sink);
+        let record = Record::read_next(&mut source)?;
+        let Some(Record::Header(read)) = record else {
+            panic!("expected header record, got {record:?}");
+        };
+        assert_eq!(read, written);
+
+        Ok(())
     }
 }
