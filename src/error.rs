@@ -138,6 +138,10 @@ pub enum SclsError {
     /// they occur under semantically distinct operations.
     #[error("Entry keys are not strictly lexicographically increasing in {namespace}")]
     NonStrictlyMonotonicKeys { namespace: String },
+
+    /// Manifest offset does not match the on-wire record length
+    #[error("Manifest offset should match the record length: expected {expected}, found {found}")]
+    InconsistentManifestOffset { expected: u32, found: u32 },
 }
 
 /// Convenience type alias for Results with SclsError.

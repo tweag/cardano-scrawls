@@ -57,25 +57,37 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// Returns an error if there is an I/O failure.
+    /// Returns an error if:
+    /// - There is an I/O failure
+    /// - The manifest offset differs from the record length
     pub fn write(&self, writer: &mut impl Write) -> Result<()> {
-        // Record length is the same as the offset
-        writer.write_all(&self.offset.to_be_bytes())?;
+        let mut buf = Vec::new();
 
-        writer.write_all(&[RecordType::Manifest.to_byte()])?;
-        writer.write_all(&self.slot_no.to_be_bytes())?;
-        writer.write_all(&self.total_entries.to_be_bytes())?;
-        writer.write_all(&self.total_chunks.to_be_bytes())?;
-        writer.write_all(&self.summary.to_bytes()?)?;
+        buf.write_all(&[RecordType::Manifest.to_byte()])?;
+        buf.write_all(&self.slot_no.to_be_bytes())?;
+        buf.write_all(&self.total_entries.to_be_bytes())?;
+        buf.write_all(&self.total_chunks.to_be_bytes())?;
+        buf.write_all(&self.summary.to_bytes()?)?;
 
         for ns_info in &self.namespace_info {
-            writer.write_all(&ns_info.to_bytes()?)?;
+            buf.write_all(&ns_info.to_bytes()?)?;
         }
-        writer.write_all(&0u32.to_be_bytes())?; // sentinel
+        buf.write_all(&0u32.to_be_bytes())?; // sentinel
 
-        writer.write_all(&self.prev_manifest.to_be_bytes())?;
-        writer.write_all(self.root_hash.as_bytes())?;
+        buf.write_all(&self.prev_manifest.to_be_bytes())?;
+        buf.write_all(self.root_hash.as_bytes())?;
+        buf.write_all(&self.offset.to_be_bytes())?;
+
+        // Record length should equal offset
+        if buf.len() != self.offset as usize {
+            return Err(SclsError::InconsistentManifestOffset {
+                expected: buf.len() as u32,
+                found: self.offset,
+            });
+        }
+
         writer.write_all(&self.offset.to_be_bytes())?;
+        writer.write_all(&buf)?;
 
         Ok(())
     }
@@ -512,6 +524,22 @@ mod tests {
             prop_assert_eq!(len_prefix, manifest.offset);
             prop_assert_eq!(len_prefix as usize, wire_in.len() + 1); // +1 for type
             prop_assert_eq!(wire_in, wire_out);
+        }
+
+        #[test]
+        fn manifest_invalid_offset(wire_in in (0usize..5).prop_flat_map(manifest_bytes)) {
+            let mut manifest = Manifest::try_from(wire_in.as_slice())?;
+
+            let mut wire_out: Vec<u8> = Vec::new();
+            let mut writer = Cursor::new(&mut wire_out);
+
+            manifest.offset += 1;
+            let result = matches!(
+                manifest.write(&mut writer),
+                Err(SclsError::InconsistentManifestOffset { .. }),
+            );
+
+            prop_assert!(result);
         }
     }
 }
