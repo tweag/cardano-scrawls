@@ -509,7 +509,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::reader::Record;
+    use crate::reader::{Record, SclsReader, VerifyOptions};
     use crate::records::Entry;
 
     use proptest::prelude::*;
@@ -772,6 +772,21 @@ mod tests {
 
             // Check namespace entries match
             prop_assert_eq!(read_by_ns, written_by_ns);
+        }
+
+        #[test]
+        fn roundtrip_verification(entries in valid_entry_writes()) {
+            let mut buf = Vec::new();
+            let mut writer = SclsWriter::builder().output(&mut buf).slot_no(0).build()?;
+
+            for (namespace, key, value) in &entries {
+                writer.write_entry(namespace.as_str(), key, value)?;
+            }
+            writer.finalise()?;
+
+            let cursor = Cursor::new(buf);
+            let mut reader = SclsReader::new(cursor);
+            prop_assert!(reader.verify(VerifyOptions::full()).is_ok());
         }
     }
 }

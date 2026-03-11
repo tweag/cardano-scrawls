@@ -342,6 +342,8 @@ fn to_tstr_bytes<S: AsRef<str>>(input: S) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -402,29 +404,30 @@ mod tests {
     // Strategy to generate a complete manifest
     fn manifest_bytes(num_namespaces: usize) -> impl Strategy<Value = Vec<u8>> {
         (
-            any::<u64>(), // slot_no
-            any::<u64>(), // total_entries
-            any::<u64>(), // total_chunks
-            summary_bytes(),
-            namespace_info_list_bytes(num_namespaces),
-            any::<u64>(),                        // prev_manifest
-            prop::array::uniform28(any::<u8>()), // root_hash
-            any::<u32>(),                        // offset
+            any::<u64>(),                              // slot_no
+            any::<u64>(),                              // total_entries
+            any::<u64>(),                              // total_chunks
+            summary_bytes(),                           // summary
+            namespace_info_list_bytes(num_namespaces), // namespace info
+            any::<u64>(),                              // prev_manifest
+            prop::array::uniform28(any::<u8>()),       // root_hash
         )
-            .prop_map(
-                |(slot, entries, chunks, summary, ns_info, prev, root, offset)| {
-                    let mut bytes = Vec::new();
-                    bytes.extend(slot.to_be_bytes());
-                    bytes.extend(entries.to_be_bytes());
-                    bytes.extend(chunks.to_be_bytes());
-                    bytes.extend(summary);
-                    bytes.extend(ns_info);
-                    bytes.extend(prev.to_be_bytes());
-                    bytes.extend(root);
-                    bytes.extend(offset.to_be_bytes());
-                    bytes
-                },
-            )
+            .prop_map(|(slot, entries, chunks, summary, ns_info, prev, root)| {
+                let mut bytes = Vec::new();
+                bytes.extend(slot.to_be_bytes());
+                bytes.extend(entries.to_be_bytes());
+                bytes.extend(chunks.to_be_bytes());
+                bytes.extend(summary);
+                bytes.extend(ns_info);
+                bytes.extend(prev.to_be_bytes());
+                bytes.extend(root);
+
+                // offset = payload length + record type(1) + offset field itself(4)
+                let offset = (bytes.len() + 1 + 4) as u32;
+                bytes.extend(offset.to_be_bytes());
+
+                bytes
+            })
     }
 
     proptest! {
@@ -468,6 +471,47 @@ mod tests {
             let truncated = &data[..data.len() - 5];
             let result = Manifest::try_from(truncated);
             prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn ns_info_roundtrip(wire_in in namespace_info_list_bytes(1)) {
+            let (ns_info_list, _) = NamespaceInfo::parse_list(&wire_in)?;
+            let ns_info = ns_info_list.first().unwrap();
+
+            let mut wire_out = ns_info.to_bytes()?;
+            wire_out.extend_from_slice(&0u32.to_be_bytes()); // sentinel
+
+            prop_assert_eq!(wire_in, wire_out);
+        }
+
+        #[test]
+        fn summary_roundtrip(wire_in in summary_bytes()) {
+            let (summary, _) = Summary::parse(&wire_in)?;
+            let wire_out = summary.to_bytes()?;
+
+            prop_assert_eq!(wire_in, wire_out);
+        }
+
+        #[test]
+        fn manifest_roundtrip(wire_in in (0usize..5).prop_flat_map(manifest_bytes)) {
+            let manifest = Manifest::try_from(wire_in.as_slice())?;
+
+            let mut wire_out: Vec<u8> = Vec::new();
+            let mut writer = Cursor::new(&mut wire_out);
+            manifest.write(&mut writer)?;
+
+            // Record length prefix _includes_ the type(1), which isn't in wire_in
+            let len_prefix = {
+                let bytes: [u8; 4] = wire_out[0..4].try_into().unwrap();
+                u32::from_be_bytes(bytes)
+            };
+
+            // Strip the length prefix(4) and record type(1)
+            let wire_out = &wire_out[5..];
+
+            prop_assert_eq!(len_prefix, manifest.offset);
+            prop_assert_eq!(len_prefix as usize, wire_in.len() + 1); // +1 for type
+            prop_assert_eq!(wire_in, wire_out);
         }
     }
 }
