@@ -350,9 +350,11 @@ mod tests {
 
     use crate::error::SclsError;
     use crate::hash::{Blake2b, Digest, HASH_SIZE, MerkleTree};
+    use crate::reader::{SclsReader, VerifyOptions};
     use crate::records::{Chunk, Manifest, NamespaceInfo, Summary};
+    use crate::writer::SclsWriter;
 
-    use super::{NSInfo, VerifyState, build_ns_info};
+    use super::*;
 
     const DUMMY_DIGEST: Digest = Digest::new([0x00; HASH_SIZE]);
 
@@ -396,10 +398,50 @@ mod tests {
 
     /* verify_chunk_entries **********************************************************************/
 
-    // TODO Test `verify_chunk_entries` with a multi-entry fixture once one is available. The
-    // current minimal fixture has only one entry and one chunk, so entry key ordering is trivially
-    // satisfied. A fixture with at least two entries in the same namespace would let us test both
-    // the happy path and key-ordering rejection.
+    // NOTE The happy path is covered by `writer::tests::roundtrip_verification` :)
+
+    #[test]
+    fn detect_disordered_keys() -> Result<()> {
+        let mut buf = Vec::new();
+        let mut writer = SclsWriter::builder().output(&mut buf).slot_no(0).build()?;
+
+        let early_key = b"bar-key";
+        let later_key = b"foo-key";
+
+        // Ensure entry key constraints are met
+        let key_len = early_key.len();
+        assert_eq!(key_len, later_key.len());
+        assert!(early_key < later_key);
+
+        // Write a valid SCLS chunk
+        writer.write_entry("test", early_key, b"a")?;
+        writer.write_entry("test", later_key, b"a")?;
+        writer.finalise()?;
+
+        // Corrupt the SCLS chunk by swapping the key values
+        let early_idx = buf
+            .windows(key_len)
+            .position(|bytes| bytes == early_key)
+            .expect("key not found");
+
+        let later_idx = buf
+            .windows(key_len)
+            .position(|bytes| bytes == later_key)
+            .expect("key not found");
+
+        buf[early_idx..early_idx + key_len].copy_from_slice(later_key);
+        buf[later_idx..later_idx + key_len].copy_from_slice(early_key);
+
+        let cursor = Cursor::new(buf);
+        let mut reader = SclsReader::new(cursor);
+
+        assert!(matches!(
+            reader.verify(VerifyOptions::full()),
+            Err(SclsError::KeysDisordered { .. })
+        ));
+
+        Ok(())
+    }
 
     /* check_chunk_ordering **********************************************************************/
 
