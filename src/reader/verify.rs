@@ -392,7 +392,6 @@ mod tests {
                 tool: String::new(),
                 comment: None,
             },
-            offset: 0,
         }
     }
 

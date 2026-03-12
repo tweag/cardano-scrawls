@@ -445,7 +445,7 @@ mod tests {
             assert_eq!(manifest.summary.comment, None);
 
             assert_eq!(
-                manifest.offset,
+                manifest.offset()?,
                 u32::from_be_bytes(FIXTURE[MANIFEST_OFFSET].try_into().unwrap())
             );
         } else {
