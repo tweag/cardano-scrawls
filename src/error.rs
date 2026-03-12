@@ -24,6 +24,10 @@ pub enum SclsError {
     #[error("malformed record: {0}")]
     MalformedRecord(String),
 
+    /// Truncated record length prefix
+    #[error("truncated record length prefix")]
+    TruncatedRecord,
+
     /// Unknown record type encountered
     #[error("unknown record type: 0x{0:02x}")]
     UnknownRecordType(u8),
