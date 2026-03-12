@@ -557,7 +557,7 @@ mod tests {
             bad_offset in any::<u32>(),
         ) {
             let len = wire_in.len();
-            prop_assume!(len as u32 != bad_offset);
+            prop_assume!((len + 1) as u32 != bad_offset);
 
             // Corrupt manifest offset (last 4 bytes)
             let offset = &mut wire_in[len - 4..];
