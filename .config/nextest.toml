@@ -1,4 +1,5 @@
 [profile.default]
+default-filter = "all()"
 fail-fast = false
 
 [profile.unit]
