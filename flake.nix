@@ -64,6 +64,7 @@
           commonArgs
           // {
             inherit cargoArtifacts;
+            doCheck = false; # We already run Nextest; this is redundant
           }
         );
       in
