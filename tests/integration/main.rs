@@ -36,17 +36,24 @@ impl SclsUtil {
 
     /// Verify an SCLS file.
     pub(crate) fn verify(&self, path: &Path) -> bool {
-        self.command().arg("verify").arg(path).status().is_ok()
+        self.command()
+            .arg("verify")
+            .arg(path)
+            .status()
+            .is_ok_and(|s| s.success())
     }
 
-    /// Checksum an SCLS file, but its global or namespace Merkle root.
+    /// Checksum an SCLS file, by its global or namespace Merkle root.
     pub(crate) fn checksum(&self, path: &Path, namespace: Option<&str>) -> bool {
         let mut args: Vec<OsString> = vec!["checksum".into(), path.into()];
         if let Some(namespace) = namespace {
             args.extend(["--namespace".into(), namespace.into()]);
         }
 
-        self.command().args(args).status().is_ok()
+        self.command()
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success())
     }
 }
 
