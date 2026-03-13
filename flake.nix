@@ -29,6 +29,9 @@
           overlays = [ (import rust-overlay) ];
         };
 
+        # scls-util binary from the cardano-cls flake
+        scls-util = cardano-cls.packages.${system}."scls-util:exe:scls-util";
+
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [
             "rust-src"
@@ -39,23 +42,20 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Common arguments for all crane builds
+        # Common arguments for all Crane builds
         commonArgs = {
-          src =
-            let
-              # Filter to include test fixtures
-              testFixturesFilter = path: _type: builtins.match ".*/tests/fixtures/.*\\.scls$" path != null;
-              testFixturesOrCargo =
-                path: type: (testFixturesFilter path type) || (craneLib.filterCargoSources path type);
-            in
-            pkgs.lib.cleanSourceWith {
-              src = ./.;
-              filter = testFixturesOrCargo;
-            };
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              ./tests
+              ./.config
+            ];
+          };
           strictDeps = true;
         };
 
-        # Build *just* the cargo dependencies, so we can reuse
+        # Build *just* the Cargo dependencies, so we can reuse
         # all of that work (e.g. via Cachix) when running in CI
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
@@ -86,14 +86,26 @@
             inherit (commonArgs) src;
           };
 
-          # Run tests with cargo-nextest
-          cardano-scrawls-nextest = craneLib.cargoNextest (
+          # Run unit tests with Nextest
+          cardano-scrawls-nextest-unit-tests = craneLib.cargoNextest (
             commonArgs
             // {
               inherit cargoArtifacts;
               partitions = 1;
               partitionType = "count";
-              cargoNextestExtraArgs = "--no-tests warn --no-fail-fast --success-output immediate --failure-output immediate";
+              cargoNextestExtraArgs = "--profile unit";
+            }
+          );
+
+          # Run integration tests with Nextest
+          cardano-scrawls-nextest-integration-tests = craneLib.cargoNextest (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              partitions = 1;
+              partitionType = "count";
+              nativeBuildInputs = [ scls-util ];
+              cargoNextestExtraArgs = "--profile integration";
             }
           );
         };
@@ -110,7 +122,7 @@
           # Additional dev tools
           packages = [
             pkgs.rust-analyzer
-            cardano-cls.packages.${system}."scls-util:exe:scls-util"
+            scls-util
           ];
 
           # Environment variables
