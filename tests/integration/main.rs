@@ -14,14 +14,14 @@ use std::process::{Command, Stdio};
 const SCLS_UTIL_BIN: &str = "scls-util";
 
 /// Namespaces supported by scls-util when generating arbitrary files.
-#[derive(Hash)]
-pub(crate) enum Namespace {
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+enum Namespace {
     BlocksV0,
     GovCommitteeV0,
     GovConstitutionV0,
     GovPParamsV0,
     GovProposalsV0,
-    NonceV0,
+    NoncesV0,
     SnapshotsV0,
     UtxoV0,
 }
@@ -37,16 +37,16 @@ impl Display for Namespace {
                 Self::GovConstitutionV0 => "gov/constitution/v0",
                 Self::GovPParamsV0 => "gov/pparams/v0",
                 Self::GovProposalsV0 => "gov/proposals/v0",
-                Self::NonceV0 => "nonce/v0",
+                Self::NoncesV0 => "nonces/v0",
                 Self::SnapshotsV0 => "snapshots/v0",
-                Self::UtxoV0 => "utx0/v0",
+                Self::UtxoV0 => "utxo/v0",
             }
         )
     }
 }
 
 /// Wrapper for scls-util functionality.
-pub(crate) struct SclsUtil {
+struct SclsUtil {
     bin: OsString,
 }
 
@@ -56,7 +56,7 @@ impl SclsUtil {
     }
 
     /// Create a new instance, if scls-util is available.
-    pub(crate) fn probe() -> Result<Self> {
+    fn probe() -> Result<Self> {
         let scls_util = SclsUtil::default();
         scls_util
             .command()
@@ -69,7 +69,7 @@ impl SclsUtil {
     }
 
     /// Verify an SCLS file.
-    pub(crate) fn verify(&self, path: &Path) -> bool {
+    fn verify(&self, path: &Path) -> bool {
         self.command()
             .arg("verify")
             .arg(path)
@@ -78,7 +78,7 @@ impl SclsUtil {
     }
 
     /// Checksum an SCLS file, by its global or namespace Merkle root.
-    pub(crate) fn checksum(&self, path: &Path, namespace: Option<&str>) -> bool {
+    fn checksum(&self, path: &Path, namespace: Option<&str>) -> bool {
         let mut args: Vec<OsString> = vec!["checksum".into(), path.into()];
         if let Some(namespace) = namespace {
             args.extend(["--namespace".into(), namespace.into()]);
@@ -90,11 +90,8 @@ impl SclsUtil {
             .is_ok_and(|s| s.success())
     }
 
-    /// Generate a random SCLS file with a count of the given namespaces.
-    pub(crate) fn generate(
-        &self,
-        namespaces: HashMap<Namespace, usize>,
-    ) -> Result<tempfile::NamedTempFile> {
+    /// Generate a random SCLS file with N entries per the given namespace.
+    fn generate(&self, namespaces: HashMap<Namespace, usize>) -> Result<tempfile::NamedTempFile> {
         let scls = tempfile::Builder::new().suffix(".scls").tempfile()?;
 
         let mut args: Vec<OsString> = vec!["debug".into(), "generate".into(), scls.path().into()];
@@ -111,7 +108,14 @@ impl SclsUtil {
             return Err(std::io::Error::other("no namespaces specified"));
         }
 
-        self.command().args(args).status()?;
+        let status = self.command().args(args).status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "{:?} exited with {status}",
+                self.bin
+            )));
+        }
+
         Ok(scls)
     }
 }
