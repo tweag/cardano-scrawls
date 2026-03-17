@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use cardano_scrawls::reader::{Record, SclsReader, VerifyOptions};
+use cardano_scrawls::reader::{CheckStructure, Record, SclsReader, VerifyOptions};
 use proptest::prelude::*;
 
 use super::{Namespace, SclsUtil};
@@ -15,7 +15,7 @@ fn namespaces(max: usize) -> impl Strategy<Value = Vec<Namespace>> {
         Namespace::GovConstitutionV0,
         Namespace::GovPParamsV0,
         Namespace::GovProposalsV0,
-        Namespace::NoncesV0,
+        // Namespace::NoncesV0, // FIXME Broken in ref impl; see tweag/cardano-cls#258
         Namespace::SnapshotsV0,
         Namespace::UtxoV0,
     ];
@@ -51,7 +51,9 @@ proptest! {
         let mut reader = SclsReader::new(scls);
 
         // Full validation
-        reader.verify(VerifyOptions::full())?;
+        // FIXME Structural validation broken by ref impl; see tweag/cardano-cls#259
+        // Change this to `VerifyOptions::full()` once resolved
+        reader.verify(VerifyOptions { check_structure: CheckStructure::Disabled, check_integrity: true })?;
 
         // Check manifest namespace info matches input parameters
         for record in reader.records()? {
