@@ -102,16 +102,6 @@ impl VerifyState {
     /// - A chunk's sequence number is not strictly greater than the previous
     /// - A chunk's namespace is bytewise less than the previous
     pub fn check_chunk_ordering(&mut self, chunk: &Chunk, full: bool) -> Result<()> {
-        // Check strict monotonicity of chunk sequence number
-        if let Some(previous) = self.prev_chunk_seqno
-            && previous >= chunk.seqno
-        {
-            return Err(SclsError::SeqnoDisordered {
-                previous,
-                found: chunk.seqno,
-            });
-        }
-
         if let Some(previous) = &self.prev_chunk_namespace {
             // Check monotonicity of chunk namespace
             if previous > &chunk.namespace {
@@ -121,11 +111,25 @@ impl VerifyState {
                 });
             }
 
-            // Reset previous namespace's previous entry key if the namespace changes during a full
-            // check
-            if full && previous != &chunk.namespace {
-                self.prev_ns_entry_key = None;
+            // Reset previous namespace's previous entry key and chunk sequence number when the
+            // namespace changes
+            if previous != &chunk.namespace {
+                self.prev_chunk_seqno = None;
+                if full {
+                    self.prev_ns_entry_key = None;
+                }
             }
+        }
+
+        // Check strict monotonicity of chunk sequence number (within current namespace)
+        if let Some(previous) = self.prev_chunk_seqno
+            && previous >= chunk.seqno
+        {
+            return Err(SclsError::SeqnoDisordered {
+                namespace: chunk.namespace.to_string(),
+                previous,
+                found: chunk.seqno,
+            });
         }
 
         Ok(())
@@ -467,7 +471,7 @@ mod tests {
 
             let is_seqno_err = matches!(
                 result,
-                Err(SclsError::SeqnoDisordered { previous, found })
+                Err(SclsError::SeqnoDisordered { previous, found, .. })
                     if previous == prev_seqno && found == this_seqno
             );
             prop_assert!(is_seqno_err);

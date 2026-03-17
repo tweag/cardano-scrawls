@@ -42,9 +42,15 @@ pub enum SclsError {
     UnexpectedEof { expected: String },
 
     /* Structural verification errors ************************************************************/
-    /// Record sequence number not increasing
-    #[error("record sequence is not increasing: previous {previous}, found {found}")]
-    SeqnoDisordered { previous: u64, found: u64 },
+    /// Record sequence number not increasing within namespace
+    #[error(
+        "record sequence is not increasing over namespace {namespace}: previous {previous}, found {found}"
+    )]
+    SeqnoDisordered {
+        namespace: String,
+        previous: u64,
+        found: u64,
+    },
 
     /// Chunk namespaces not in bytewise ascending order
     #[error(

@@ -16,6 +16,9 @@ pub const DEFAULT_TOOL: &str = "cardano-scrawls";
 /// Default maximum chunk size (modulo pathologically large entries)
 pub const DEFAULT_MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// Initial chunk sequence number
+pub const INITIAL_CHUNK_SEQNO: u64 = 0;
+
 /// SclsWriter builder.
 #[derive(Debug)]
 pub struct SclsWriterBuilder<W: Write> {
@@ -84,7 +87,7 @@ impl<W: Write> SclsWriterBuilder<W> {
             max_chunk_size: self.max_chunk_size,
             prev_namespace: None,
             prev_ns_entry_key: None,
-            chunk_seqno: 0,
+            chunk_seqno: INITIAL_CHUNK_SEQNO,
             current_chunk: None,
             ns_state: BTreeMap::new(),
         };
@@ -185,6 +188,7 @@ pub struct SclsWriter<W> {
     prev_ns_entry_key: Option<Vec<u8>>,
 
     /// Chunk sequence number
+    // NOTE Reset this to `INITIAL_CHUNK_SEQNO` when `prev_namespace` changes
     chunk_seqno: u64,
 
     /// Chunk state
@@ -233,6 +237,7 @@ impl<W: Write> SclsWriter<W> {
                         self.flush_chunk()?;
                         self.prev_namespace = Some(namespace.to_string());
                         self.prev_ns_entry_key = None;
+                        self.chunk_seqno = INITIAL_CHUNK_SEQNO;
                         self.ns_state
                             .insert(namespace.to_string(), NamespaceState::new());
                     }
@@ -716,10 +721,16 @@ mod tests {
             let header_first = matches!(Record::read_next(&mut cursor)?, Some(Record::Header(_)));
             prop_assert!(header_first);
 
-            let mut seqno = 0;
+            let mut seqno = INITIAL_CHUNK_SEQNO;
+            let mut prev_namespace = None;
 
             while let Some(Record::Chunk(chunk)) = Record::read_next(&mut cursor)? {
                 let mut cursor = Cursor::new(buf.clone());
+
+                if let Some(previous) = prev_namespace && previous != chunk.namespace {
+                    // Reset the chunk sequence number every time the namespace changes
+                    seqno = INITIAL_CHUNK_SEQNO;
+                }
 
                 // Check ascending sequence number
                 prop_assert_eq!(chunk.seqno, seqno);
@@ -739,6 +750,8 @@ mod tests {
 
                     Ok(())
                 })?;
+
+                prev_namespace = Some(chunk.namespace);
             }
 
             // Check namespace entries match
