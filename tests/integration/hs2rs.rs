@@ -7,31 +7,12 @@ use proptest::prelude::*;
 
 use super::{Namespace, SclsUtil};
 
-// Strategy for generating subsets of namespaces
-fn namespaces(max: usize) -> impl Strategy<Value = Vec<Namespace>> {
-    let variants = vec![
-        Namespace::BlocksV0,
-        Namespace::GovCommitteeV0,
-        Namespace::GovConstitutionV0,
-        Namespace::GovPParamsV0,
-        Namespace::GovProposalsV0,
-        // Namespace::NoncesV0, // FIXME Broken in ref impl; see tweag/cardano-cls#258
-        Namespace::SnapshotsV0,
-        Namespace::UtxoV0,
-    ];
-
-    // Clamp upper limit to number of variants
-    let max = max.min(variants.len());
-
-    proptest::sample::subsequence(variants, 1..=max)
-}
-
 // Strategy for generating collections of namespaces with entry counts
 fn namespaces_with_chunk_count(
     max_namespaces: usize,
     max_entries: usize,
 ) -> impl Strategy<Value = HashMap<Namespace, usize>> {
-    namespaces(max_namespaces).prop_flat_map(move |keys| {
+    Namespace::subset(max_namespaces).prop_flat_map(move |keys| {
         let ns_count = keys.len();
 
         proptest::collection::vec(1..=max_entries, ns_count)

@@ -10,6 +10,8 @@ use std::io::Result;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use proptest::prelude::Strategy;
+
 /// Default binary name (must be in `$PATH`)
 const SCLS_UTIL_BIN: &str = "scls-util";
 
@@ -24,6 +26,27 @@ enum Namespace {
     NoncesV0,
     SnapshotsV0,
     UtxoV0,
+}
+
+impl Namespace {
+    /// Strategy for generating non-empty subsets of namespaces
+    fn subset(max_size: usize) -> impl Strategy<Value = Vec<Self>> {
+        let variants = vec![
+            Namespace::BlocksV0,
+            Namespace::GovCommitteeV0,
+            Namespace::GovConstitutionV0,
+            Namespace::GovPParamsV0,
+            Namespace::GovProposalsV0,
+            // Namespace::NoncesV0, // FIXME Broken in ref impl; see tweag/cardano-cls#258
+            Namespace::SnapshotsV0,
+            Namespace::UtxoV0,
+        ];
+
+        // Clamp upper limit to number of variants
+        let max = max_size.min(variants.len());
+
+        proptest::sample::subsequence(variants, 1..=max)
+    }
 }
 
 impl Display for Namespace {
