@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use cardano_scrawls::writer::SclsWriter;
 use proptest::prelude::*;
 
 use super::{Namespace, SclsUtil};
@@ -55,5 +56,36 @@ prop_compose! {
             .zip(values)
             .map(|((ns, key), value)| (ns, key, value))
             .collect()
+    }
+}
+
+proptest! {
+    #[test]
+    fn verify_merkle_roots_against_reference(entries in valid_entry_writes(5, 5)) {
+        let Ok(scls_util) = SclsUtil::probe() else {
+            // Skip if scls-util isn't available
+            return Ok(());
+        };
+
+        let mut scls = tempfile::Builder::new().suffix(".scls").tempfile()?;
+        let mut writer = SclsWriter::builder().output(&mut scls).slot_no(0).build()?;
+
+        for (namespace, key, value) in &entries {
+            writer.write_entry(namespace.as_str(), key, value)?;
+        }
+        writer.finalise()?;
+
+        // Check the global Merkle root
+        prop_assert!(scls_util.checksum(scls.path(), None));
+
+        let namespaces: BTreeSet<String> = entries
+            .iter()
+            .map(|(ns, _, _)| ns.to_string())
+            .collect();
+
+        for namespace in namespaces {
+            // Check each namespace Merkle root
+            prop_assert!(scls_util.checksum(scls.path(), Some(namespace.as_str())));
+        }
     }
 }

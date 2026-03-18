@@ -97,16 +97,7 @@ impl SclsUtil {
         Ok(scls_util)
     }
 
-    /// Verify an SCLS file.
-    fn verify(&self, path: &Path) -> bool {
-        self.command()
-            .arg("verify")
-            .arg(path)
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-
-    /// Checksum an SCLS file, by its global or namespace Merkle root.
+    /// Check the checksum of an SCLS file, by its global or namespace Merkle root.
     fn checksum(&self, path: &Path, namespace: Option<&str>) -> bool {
         let mut args: Vec<OsString> = vec!["checksum".into(), path.into()];
         if let Some(namespace) = namespace {
