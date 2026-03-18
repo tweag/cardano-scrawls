@@ -44,7 +44,7 @@ pub enum SclsError {
     /* Structural verification errors ************************************************************/
     /// Record sequence number not increasing within namespace
     #[error(
-        "record sequence is not increasing over namespace {namespace}: previous {previous}, found {found}"
+        "record sequence is not increasing within namespace {namespace}: previous {previous}, found {found}"
     )]
     SeqnoDisordered {
         namespace: String,

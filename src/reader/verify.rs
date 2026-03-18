@@ -14,7 +14,7 @@ pub enum CheckStructure {
     Disabled,
 
     /// Verify that:
-    /// - the chunk sequence is strictly monotonically increasing;
+    /// - the chunk sequence is strictly monotonically increasing within each namespace;
     /// - chunk namespaces are in bytewise ascending order;
     /// - manifest chunk and entry counts are correct for each namespace.
     Simple,
@@ -92,14 +92,15 @@ impl VerifyState {
         }
     }
 
-    /// Check that chunk sequence numbers are strictly monotonically increasing and that chunk
-    /// namespaces are in bytewise ascending order. When `full` is set, the previous entry key is
-    /// reset on namespace change (to prepare for per-namespace key ordering checks).
+    /// Check that chunk sequence numbers are strictly monotonically increasing within each
+    /// namespace and that chunk namespaces are in bytewise ascending order. When `full` is set,
+    /// the previous entry key is reset on namespace change (to prepare for per-namespace key
+    /// ordering checks).
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - A chunk's sequence number is not strictly greater than the previous
+    /// - An intra-namespace chunk's sequence number is not strictly greater than the previous
     /// - A chunk's namespace is bytewise less than the previous
     pub fn check_chunk_ordering(&mut self, chunk: &Chunk, full: bool) -> Result<()> {
         if let Some(previous) = &self.prev_chunk_namespace {
