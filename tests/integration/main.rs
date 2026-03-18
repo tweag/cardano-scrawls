@@ -24,7 +24,9 @@ enum Namespace {
     GovPParamsV0,
     GovProposalsV0,
     NoncesV0,
-    SnapshotsV0,
+    SnapshotsMarkV0,
+    SnapshotsSetV0,
+    SnapshotsGoV0,
     UtxoV0,
 }
 
@@ -37,8 +39,10 @@ impl Namespace {
             Namespace::GovConstitutionV0,
             Namespace::GovPParamsV0,
             Namespace::GovProposalsV0,
-            // Namespace::NoncesV0, // FIXME Broken in ref impl; see tweag/cardano-cls#258
-            Namespace::SnapshotsV0,
+            Namespace::NoncesV0,
+            Namespace::SnapshotsMarkV0,
+            Namespace::SnapshotsSetV0,
+            Namespace::SnapshotsGoV0,
             Namespace::UtxoV0,
         ];
 
@@ -61,7 +65,9 @@ impl Display for Namespace {
                 Self::GovPParamsV0 => "gov/pparams/v0",
                 Self::GovProposalsV0 => "gov/proposals/v0",
                 Self::NoncesV0 => "nonces/v0",
-                Self::SnapshotsV0 => "snapshots/v0",
+                Self::SnapshotsMarkV0 => "snapshots/mark/v0",
+                Self::SnapshotsSetV0 => "snapshots/set/v0",
+                Self::SnapshotsGoV0 => "snapshots/go/v0",
                 Self::UtxoV0 => "utxo/v0",
             }
         )

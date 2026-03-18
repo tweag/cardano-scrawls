@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 
-use cardano_scrawls::reader::{CheckStructure, Record, SclsReader, VerifyOptions};
+use cardano_scrawls::reader::{Record, SclsReader, VerifyOptions};
 use proptest::prelude::*;
 
 use super::{Namespace, SclsUtil};
 
 // Strategy for generating collections of namespaces with entry counts
-fn namespaces_with_chunk_count(
+fn namespaces_with_entry_count(
     max_namespaces: usize,
     max_entries: usize,
 ) -> impl Strategy<Value = HashMap<Namespace, usize>> {
@@ -22,7 +22,7 @@ fn namespaces_with_chunk_count(
 
 proptest! {
     #[test]
-    fn verify_reference_output(params in namespaces_with_chunk_count(5, 5)) {
+    fn verify_reference_output(params in namespaces_with_entry_count(5, 5)) {
         let Ok(scls_util) = SclsUtil::probe() else {
             // Skip if scls-util isn't available
             return Ok(());
@@ -32,9 +32,7 @@ proptest! {
         let mut reader = SclsReader::new(scls);
 
         // Full validation
-        // FIXME Structural validation broken by ref impl; see tweag/cardano-cls#259
-        // Change this to `VerifyOptions::full()` once resolved
-        reader.verify(VerifyOptions { check_structure: CheckStructure::Disabled, check_integrity: true })?;
+        reader.verify(VerifyOptions::full())?;
 
         // Check manifest namespace info matches input parameters
         for record in reader.records()? {
