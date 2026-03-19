@@ -1,9 +1,11 @@
 //! SCLS manifest record.
 
+use std::io::Write;
 use std::str;
 
 use crate::error::{Result, SclsError};
 use crate::hash::{Digest, HASH_SIZE};
+use crate::records::RecordType;
 
 /// The manifest record (record type 0x01) containing file metadata and integrity information.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,47 @@ pub struct NamespaceInfo {
 
     /// Merkle root of all live entries in this namespace
     pub digest: Digest,
+}
+
+impl Manifest {
+    /// Write the manifest record to the writer stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - There is an I/O failure
+    /// - The manifest offset differs from the record length
+    pub fn write(&self, writer: &mut impl Write) -> Result<()> {
+        let mut buf = Vec::new();
+
+        buf.write_all(&[RecordType::Manifest.to_byte()])?;
+        buf.write_all(&self.slot_no.to_be_bytes())?;
+        buf.write_all(&self.total_entries.to_be_bytes())?;
+        buf.write_all(&self.total_chunks.to_be_bytes())?;
+        buf.write_all(&self.summary.to_bytes()?)?;
+
+        for ns_info in &self.namespace_info {
+            buf.write_all(&ns_info.to_bytes()?)?;
+        }
+        buf.write_all(&0u32.to_be_bytes())?; // sentinel
+
+        buf.write_all(&self.prev_manifest.to_be_bytes())?;
+        buf.write_all(self.root_hash.as_bytes())?;
+        buf.write_all(&self.offset.to_be_bytes())?;
+
+        // Record length should equal offset
+        if buf.len() != self.offset as usize {
+            return Err(SclsError::InconsistentManifestOffset {
+                expected: buf.len() as u32,
+                found: self.offset,
+            });
+        }
+
+        writer.write_all(&self.offset.to_be_bytes())?;
+        writer.write_all(&buf)?;
+
+        Ok(())
+    }
 }
 
 impl NamespaceInfo {
@@ -113,6 +156,22 @@ impl NamespaceInfo {
 
         Ok((namespaces, pos))
     }
+
+    /// Return the wire serialisation of the namespace info.
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        let len_ns = u32::try_from(self.name.len())
+            .map_err(|_| SclsError::WireLengthOverflow("namespace length".into()))?;
+
+        buf.extend_from_slice(&len_ns.to_be_bytes());
+        buf.extend_from_slice(&self.entries_count.to_be_bytes());
+        buf.extend_from_slice(&self.chunks_count.to_be_bytes());
+        buf.extend_from_slice(self.name.as_bytes());
+        buf.extend_from_slice(self.digest.as_bytes());
+
+        Ok(buf)
+    }
 }
 
 /// Summary metadata about file creation.
@@ -157,6 +216,15 @@ impl Summary {
             },
             pos,
         ))
+    }
+
+    /// Return the wire serialisation of the summary.
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf = to_tstr_bytes(&self.created_at)?;
+        buf.extend(to_tstr_bytes(&self.tool)?);
+        buf.extend(to_tstr_bytes(self.comment.as_deref().unwrap_or(""))?);
+
+        Ok(buf)
     }
 }
 
@@ -269,8 +337,25 @@ fn parse_tstr(data: &[u8]) -> Result<(String, usize)> {
     Ok((s, total_len))
 }
 
+/// Convert an AsRef<str> into a length-prefixed UTF-8 string (`tstr` in the Kaitai spec).
+///
+/// # Errors
+///
+/// Returns an error if there's a length overflow
+fn to_tstr_bytes<S: AsRef<str>>(input: S) -> Result<Vec<u8>> {
+    let len = u32::try_from(input.as_ref().len())
+        .map_err(|_| SclsError::WireLengthOverflow("tstr".into()))?;
+
+    let mut buf = len.to_be_bytes().to_vec();
+    buf.extend_from_slice(input.as_ref().as_bytes());
+
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -331,29 +416,30 @@ mod tests {
     // Strategy to generate a complete manifest
     fn manifest_bytes(num_namespaces: usize) -> impl Strategy<Value = Vec<u8>> {
         (
-            any::<u64>(), // slot_no
-            any::<u64>(), // total_entries
-            any::<u64>(), // total_chunks
-            summary_bytes(),
-            namespace_info_list_bytes(num_namespaces),
-            any::<u64>(),                        // prev_manifest
-            prop::array::uniform28(any::<u8>()), // root_hash
-            any::<u32>(),                        // offset
+            any::<u64>(),                              // slot_no
+            any::<u64>(),                              // total_entries
+            any::<u64>(),                              // total_chunks
+            summary_bytes(),                           // summary
+            namespace_info_list_bytes(num_namespaces), // namespace info
+            any::<u64>(),                              // prev_manifest
+            prop::array::uniform28(any::<u8>()),       // root_hash
         )
-            .prop_map(
-                |(slot, entries, chunks, summary, ns_info, prev, root, offset)| {
-                    let mut bytes = Vec::new();
-                    bytes.extend(slot.to_be_bytes());
-                    bytes.extend(entries.to_be_bytes());
-                    bytes.extend(chunks.to_be_bytes());
-                    bytes.extend(summary);
-                    bytes.extend(ns_info);
-                    bytes.extend(prev.to_be_bytes());
-                    bytes.extend(root);
-                    bytes.extend(offset.to_be_bytes());
-                    bytes
-                },
-            )
+            .prop_map(|(slot, entries, chunks, summary, ns_info, prev, root)| {
+                let mut bytes = Vec::new();
+                bytes.extend(slot.to_be_bytes());
+                bytes.extend(entries.to_be_bytes());
+                bytes.extend(chunks.to_be_bytes());
+                bytes.extend(summary);
+                bytes.extend(ns_info);
+                bytes.extend(prev.to_be_bytes());
+                bytes.extend(root);
+
+                // offset = payload length + record type(1) + offset field itself(4)
+                let offset = (bytes.len() + 1 + 4) as u32;
+                bytes.extend(offset.to_be_bytes());
+
+                bytes
+            })
     }
 
     proptest! {
@@ -397,6 +483,63 @@ mod tests {
             let truncated = &data[..data.len() - 5];
             let result = Manifest::try_from(truncated);
             prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn ns_info_roundtrip(wire_in in namespace_info_list_bytes(1)) {
+            let (ns_info_list, _) = NamespaceInfo::parse_list(&wire_in)?;
+            let ns_info = ns_info_list.first().unwrap();
+
+            let mut wire_out = ns_info.to_bytes()?;
+            wire_out.extend_from_slice(&0u32.to_be_bytes()); // sentinel
+
+            prop_assert_eq!(wire_in, wire_out);
+        }
+
+        #[test]
+        fn summary_roundtrip(wire_in in summary_bytes()) {
+            let (summary, _) = Summary::parse(&wire_in)?;
+            let wire_out = summary.to_bytes()?;
+
+            prop_assert_eq!(wire_in, wire_out);
+        }
+
+        #[test]
+        fn manifest_roundtrip(wire_in in (0usize..5).prop_flat_map(manifest_bytes)) {
+            let manifest = Manifest::try_from(wire_in.as_slice())?;
+
+            let mut wire_out: Vec<u8> = Vec::new();
+            let mut writer = Cursor::new(&mut wire_out);
+            manifest.write(&mut writer)?;
+
+            // Record length prefix _includes_ the type(1), which isn't in wire_in
+            let len_prefix = {
+                let bytes: [u8; 4] = wire_out[0..4].try_into().unwrap();
+                u32::from_be_bytes(bytes)
+            };
+
+            // Strip the length prefix(4) and record type(1)
+            let wire_out = &wire_out[5..];
+
+            prop_assert_eq!(len_prefix, manifest.offset);
+            prop_assert_eq!(len_prefix as usize, wire_in.len() + 1); // +1 for type
+            prop_assert_eq!(wire_in, wire_out);
+        }
+
+        #[test]
+        fn manifest_invalid_offset(wire_in in (0usize..5).prop_flat_map(manifest_bytes)) {
+            let mut manifest = Manifest::try_from(wire_in.as_slice())?;
+
+            let mut wire_out: Vec<u8> = Vec::new();
+            let mut writer = Cursor::new(&mut wire_out);
+
+            manifest.offset += 1;
+            let result = matches!(
+                manifest.write(&mut writer),
+                Err(SclsError::InconsistentManifestOffset { .. }),
+            );
+
+            prop_assert!(result);
         }
     }
 }
