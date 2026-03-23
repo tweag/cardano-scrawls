@@ -1,0 +1,9 @@
+[profile.default]
+default-filter = "all()"
+fail-fast = false
+
+[profile.unit]
+default-filter = "kind(lib)"
+
+[profile.integration]
+default-filter = "kind(test)"
