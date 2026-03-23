@@ -60,7 +60,7 @@ impl Manifest {
         buf.write_all(&len.to_be_bytes())?;
 
         // Record length should equal offset
-        if buf.len() != self.offset()? as usize {
+        if buf.len() != len as usize {
             return Err(SclsError::InconsistentManifestOffset {
                 expected: buf.len() as u32,
                 found: len,
