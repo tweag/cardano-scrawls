@@ -30,10 +30,178 @@ pub struct Manifest {
 
     /// Summary metadata about file creation
     pub summary: Summary,
+}
 
-    /// Relative offset to the beginning of this record
-    /// (can be used to find the manifest by reading the last 4 bytes of the file)
-    pub offset: u32,
+impl Manifest {
+    /// Write the manifest record to the writer stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - There is an I/O failure
+    /// - The manifest offset differs from the record length
+    pub fn write(&self, writer: &mut impl Write) -> Result<()> {
+        let mut buf = Vec::new();
+        let len = self.offset()?;
+
+        buf.write_all(&[RecordType::Manifest.to_byte()])?;
+        buf.write_all(&self.slot_no.to_be_bytes())?;
+        buf.write_all(&self.total_entries.to_be_bytes())?;
+        buf.write_all(&self.total_chunks.to_be_bytes())?;
+        buf.write_all(&self.summary.to_bytes()?)?;
+
+        for ns_info in &self.namespace_info {
+            buf.write_all(&ns_info.to_bytes()?)?;
+        }
+        buf.write_all(&0u32.to_be_bytes())?; // sentinel
+
+        buf.write_all(&self.prev_manifest.to_be_bytes())?;
+        buf.write_all(self.root_hash.as_bytes())?;
+        buf.write_all(&len.to_be_bytes())?;
+
+        // Record length should equal offset
+        if buf.len() != len as usize {
+            return Err(SclsError::InconsistentManifestOffset {
+                expected: buf.len() as u32,
+                found: len,
+            });
+        }
+
+        writer.write_all(&len.to_be_bytes())?;
+        writer.write_all(&buf)?;
+
+        Ok(())
+    }
+
+    /// Compute the relative offset (wire length) to the beginning of this record. This can be used
+    /// to find the manifest by reading the last 4 bytes of a non-amended SCLS file.
+    ///
+    /// # Errors
+    ///
+    /// Return an error if the manifest payload overflows.
+    pub fn offset(&self) -> Result<u32> {
+        // Length prefixed (u32) UTF-8 strings
+        let created_at_len = 4 + self.summary.created_at.len();
+        let tool_len = 4 + self.summary.tool.len();
+        let comment_len = 4 + self.summary.comment.as_ref().map_or(0, String::len);
+
+        let ns_info_len = self.namespace_info.iter().fold(0usize, |acc, ns_info| {
+            // Namespace info wire length:
+            // len_ns(4) + entries(8) + chunks(8) + namespace(len_ns) + digest(HASH_SIZE)
+            acc + 4 + 8 + 8 + ns_info.name.len() + HASH_SIZE
+        });
+
+        // A rather nice property of the manifest record is that its offset field is the same as
+        // the payload length on the wire, so it's bookended by the same value.
+        u32::try_from(
+            [
+                1,              // Type
+                8,              // Slot number
+                8,              // Total entries
+                8,              // Total chunks
+                created_at_len, // Summary: created at
+                tool_len,       // Summary: tool
+                comment_len,    // Summary: comment
+                ns_info_len,    // Namespace info
+                4,              // ns_info terminal sentinel
+                8,              // Previous manifest
+                HASH_SIZE,      // Global hash
+                4,              // Offset
+            ]
+            .iter()
+            .try_fold(0usize, |acc, &x| acc.checked_add(x))
+            .ok_or(SclsError::WireLengthOverflow("manifest offset".into()))?,
+        )
+        .map_err(|_| SclsError::WireLengthOverflow("manifest offset".into()))
+    }
+}
+
+impl TryFrom<&[u8]> for Manifest {
+    type Error = SclsError;
+
+    /// Parses a manifest record from its payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The payload is too short for required fields
+    /// - UTF-8 decoding fails for strings
+    /// - Namespace info parsing fails
+    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
+        let mut pos = 0;
+
+        // Parse fixed-size header fields (slot_no, total_entries, total_chunks)
+        if value.len() < 24 {
+            return Err(SclsError::MalformedRecord(
+                "manifest too short for header fields".into(),
+            ));
+        }
+
+        let slot_no = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        let total_entries = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        let total_chunks = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        // Parse summary (3 length-prefixed strings)
+        let (summary, bytes_read) = Summary::parse(&value[pos..])?;
+        pos += bytes_read;
+
+        // Parse namespace_info (repeated until len_ns == 0)
+        let (namespace_info, bytes_read) = NamespaceInfo::parse_list(&value[pos..])?;
+        pos += bytes_read;
+
+        // Parse footer fields
+        let needed_len = pos
+            .checked_add(40)
+            .ok_or_else(|| SclsError::MalformedRecord("footer length overflow".into()))?;
+
+        if value.len() < needed_len {
+            return Err(SclsError::MalformedRecord(
+                "manifest too short for footer fields".into(),
+            ));
+        }
+
+        let prev_manifest = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        let root_hash_bytes: [u8; HASH_SIZE] = value[pos..pos + HASH_SIZE].try_into().unwrap();
+        let root_hash = root_hash_bytes.into();
+        pos += HASH_SIZE;
+
+        let offset = u32::from_be_bytes(value[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+
+        // Verify that we consumed everything
+        if pos != value.len() {
+            return Err(SclsError::MalformedRecord(format!(
+                "manifest has {} trailing bytes",
+                value.len() - pos
+            )));
+        }
+
+        let manifest = Manifest {
+            slot_no,
+            total_entries,
+            total_chunks,
+            root_hash,
+            namespace_info,
+            prev_manifest,
+            summary,
+        };
+
+        // Check offset matches the computed value
+        if offset != manifest.offset()? {
+            return Err(SclsError::MalformedRecord(
+                "manifest offset does not match record length".into(),
+            ));
+        }
+
+        Ok(manifest)
+    }
 }
 
 /// Information about a single namespace within the file
@@ -50,47 +218,6 @@ pub struct NamespaceInfo {
 
     /// Merkle root of all live entries in this namespace
     pub digest: Digest,
-}
-
-impl Manifest {
-    /// Write the manifest record to the writer stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - There is an I/O failure
-    /// - The manifest offset differs from the record length
-    pub fn write(&self, writer: &mut impl Write) -> Result<()> {
-        let mut buf = Vec::new();
-
-        buf.write_all(&[RecordType::Manifest.to_byte()])?;
-        buf.write_all(&self.slot_no.to_be_bytes())?;
-        buf.write_all(&self.total_entries.to_be_bytes())?;
-        buf.write_all(&self.total_chunks.to_be_bytes())?;
-        buf.write_all(&self.summary.to_bytes()?)?;
-
-        for ns_info in &self.namespace_info {
-            buf.write_all(&ns_info.to_bytes()?)?;
-        }
-        buf.write_all(&0u32.to_be_bytes())?; // sentinel
-
-        buf.write_all(&self.prev_manifest.to_be_bytes())?;
-        buf.write_all(self.root_hash.as_bytes())?;
-        buf.write_all(&self.offset.to_be_bytes())?;
-
-        // Record length should equal offset
-        if buf.len() != self.offset as usize {
-            return Err(SclsError::InconsistentManifestOffset {
-                expected: buf.len() as u32,
-                found: self.offset,
-            });
-        }
-
-        writer.write_all(&self.offset.to_be_bytes())?;
-        writer.write_all(&buf)?;
-
-        Ok(())
-    }
 }
 
 impl NamespaceInfo {
@@ -225,86 +352,6 @@ impl Summary {
         buf.extend(to_tstr_bytes(self.comment.as_deref().unwrap_or(""))?);
 
         Ok(buf)
-    }
-}
-
-impl TryFrom<&[u8]> for Manifest {
-    type Error = SclsError;
-
-    /// Parses a manifest record from its payload.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The payload is too short for required fields
-    /// - UTF-8 decoding fails for strings
-    /// - Namespace info parsing fails
-    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
-        let mut pos = 0;
-
-        // Parse fixed-size header fields (slot_no, total_entries, total_chunks)
-        if value.len() < 24 {
-            return Err(SclsError::MalformedRecord(
-                "manifest too short for header fields".into(),
-            ));
-        }
-
-        let slot_no = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        let total_entries = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        let total_chunks = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        // Parse summary (3 length-prefixed strings)
-        let (summary, bytes_read) = Summary::parse(&value[pos..])?;
-        pos += bytes_read;
-
-        // Parse namespace_info (repeated until len_ns == 0)
-        let (namespace_info, bytes_read) = NamespaceInfo::parse_list(&value[pos..])?;
-        pos += bytes_read;
-
-        // Parse footer fields
-        let needed_len = pos
-            .checked_add(40)
-            .ok_or_else(|| SclsError::MalformedRecord("footer length overflow".into()))?;
-
-        if value.len() < needed_len {
-            return Err(SclsError::MalformedRecord(
-                "manifest too short for footer fields".into(),
-            ));
-        }
-
-        let prev_manifest = u64::from_be_bytes(value[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        let root_hash_bytes: [u8; HASH_SIZE] = value[pos..pos + HASH_SIZE].try_into().unwrap();
-        let root_hash = root_hash_bytes.into();
-        pos += HASH_SIZE;
-
-        let offset = u32::from_be_bytes(value[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-
-        // Verify that we consumed everything
-        if pos != value.len() {
-            return Err(SclsError::MalformedRecord(format!(
-                "manifest has {} trailing bytes",
-                value.len() - pos
-            )));
-        }
-
-        Ok(Manifest {
-            slot_no,
-            total_entries,
-            total_chunks,
-            root_hash,
-            namespace_info,
-            prev_manifest,
-            summary,
-            offset,
-        })
     }
 }
 
@@ -505,6 +552,21 @@ mod tests {
         }
 
         #[test]
+        fn manifest_invalid_offset(
+            mut wire_in in (0usize..5).prop_flat_map(manifest_bytes),
+            bad_offset in any::<u32>(),
+        ) {
+            let len = wire_in.len();
+            prop_assume!((len + 1) as u32 != bad_offset);
+
+            // Corrupt manifest offset (last 4 bytes)
+            let offset = &mut wire_in[len - 4..];
+            offset.copy_from_slice(&bad_offset.to_be_bytes());
+
+            prop_assert!(Manifest::try_from(wire_in.as_slice()).is_err());
+        }
+
+        #[test]
         fn manifest_roundtrip(wire_in in (0usize..5).prop_flat_map(manifest_bytes)) {
             let manifest = Manifest::try_from(wire_in.as_slice())?;
 
@@ -521,25 +583,9 @@ mod tests {
             // Strip the length prefix(4) and record type(1)
             let wire_out = &wire_out[5..];
 
-            prop_assert_eq!(len_prefix, manifest.offset);
+            prop_assert_eq!(len_prefix, manifest.offset()?);
             prop_assert_eq!(len_prefix as usize, wire_in.len() + 1); // +1 for type
             prop_assert_eq!(wire_in, wire_out);
-        }
-
-        #[test]
-        fn manifest_invalid_offset(wire_in in (0usize..5).prop_flat_map(manifest_bytes)) {
-            let mut manifest = Manifest::try_from(wire_in.as_slice())?;
-
-            let mut wire_out: Vec<u8> = Vec::new();
-            let mut writer = Cursor::new(&mut wire_out);
-
-            manifest.offset += 1;
-            let result = matches!(
-                manifest.write(&mut writer),
-                Err(SclsError::InconsistentManifestOffset { .. }),
-            );
-
-            prop_assert!(result);
         }
     }
 }

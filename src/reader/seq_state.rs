@@ -157,7 +157,6 @@ mod tests {
             tool: String::new(),
             comment: None,
         },
-        offset: 0,
     });
 
     /// Strategy for generating valid record sequences.

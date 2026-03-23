@@ -434,7 +434,6 @@ impl<W: Write> SclsWriter<W> {
         let mut namespace_info = Vec::new();
         let mut total_entries = 0u64;
         let mut total_chunks = 0u64;
-        let mut ns_info_len = 0usize;
 
         // Compute manifest state
         for (namespace, info) in self.ns_state {
@@ -447,10 +446,6 @@ impl<W: Write> SclsWriter<W> {
             total_entries += info.entries;
             total_chunks += info.chunks;
 
-            // Namespace info wire length:
-            // len_ns(4) + entries(8) + chunks(8) + namespace(len_ns) + digest(HASH_SIZE)
-            ns_info_len += 4 + 8 + 8 + namespace.len() + HASH_SIZE;
-
             namespace_info.push(NamespaceInfo {
                 entries_count: info.entries,
                 chunks_count: info.chunks,
@@ -461,29 +456,6 @@ impl<W: Write> SclsWriter<W> {
 
         // Current UTC timestamp in RFC 3339 format, with second resolution and Zulu time zone
         let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-
-        // A rather nice property of the manifest record is that its offset field is the same as
-        // the payload length on the wire, so it's bookended by the same value.
-        let offset = u32::try_from(
-            [
-                1,                                                // Type
-                8,                                                // Slot number
-                8,                                                // Total entries
-                8,                                                // Total chunks
-                4 + created_at.len(),                             // Summary: created at
-                4 + self.tool.len(),                              // Summary: tool
-                4 + self.comment.as_ref().map_or(0, |s| s.len()), // Summary: comment
-                ns_info_len,                                      // Namespace info
-                4,                                                // ns_info terminal sentinel
-                8,                                                // Previous manifest
-                HASH_SIZE,                                        // Global hash
-                4,                                                // Offset
-            ]
-            .iter()
-            .try_fold(0usize, |acc, &x| acc.checked_add(x))
-            .ok_or(SclsError::WireLengthOverflow("manifest offset".into()))?,
-        )
-        .map_err(|_| SclsError::WireLengthOverflow("manifest offset".into()))?;
 
         let manifest = Manifest {
             slot_no: self.slot_no,
@@ -497,7 +469,6 @@ impl<W: Write> SclsWriter<W> {
                 tool: self.tool,
                 comment: self.comment,
             },
-            offset,
         };
 
         manifest.write(&mut self.output)

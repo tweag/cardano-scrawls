@@ -155,14 +155,26 @@ impl Record {
     /// - The record payload is malformed
     pub fn read_next<R: Read + Seek>(reader: &mut R) -> Result<Option<Self>> {
         // Read the 4-byte length prefix
+        // NOTE We don't use `read_exact` here because it conflates clean EOF (0 bytes read on
+        // first attempt) with truncation (partial read). We need to distinguish these to detect
+        // corrupted or truncated files.
         let mut len_buf = [0u8; 4];
-        if let Err(e) = reader.read_exact(&mut len_buf) {
-            // NOTE We don't distinguish between EOF or a partial read, so an incomplete length at
-            // the end of the file won't be picked up as a truncated/corrupted file; see issue #9.
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Ok(None);
+        let mut bytes_read = 0;
+        while bytes_read < len_buf.len() {
+            match reader.read(&mut len_buf[bytes_read..]) {
+                // Clean EOF
+                Ok(0) if bytes_read == 0 => return Ok(None),
+
+                // Partial read treated as an error
+                Ok(0) => return Err(SclsError::TruncatedRecord),
+
+                Ok(n) => bytes_read += n,
+
+                // Retry on interrupt (which will probably never happen)
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+
+                Err(e) => return Err(e.into()),
             }
-            return Err(e.into());
         }
 
         // Check the payload isn't empty
@@ -280,7 +292,7 @@ mod tests {
     use crate::error::Result;
     use crate::records::{ChunkFormat, Entry};
 
-    use super::{Record, SclsReader, VerifyOptions};
+    use super::*;
 
     /// Slurped in fixture generated from Haskell reference implementation:
     ///
@@ -433,7 +445,7 @@ mod tests {
             assert_eq!(manifest.summary.comment, None);
 
             assert_eq!(
-                manifest.offset,
+                manifest.offset()?,
                 u32::from_be_bytes(FIXTURE[MANIFEST_OFFSET].try_into().unwrap())
             );
         } else {
@@ -448,5 +460,16 @@ mod tests {
         let scls = Cursor::new(FIXTURE);
         let mut reader = SclsReader::new(scls);
         reader.verify(VerifyOptions::full())
+    }
+
+    #[test]
+    fn detect_truncated_record() {
+        let buf = [0u8; 3];
+        let mut cursor = Cursor::new(buf);
+
+        assert!(matches!(
+            Record::read_next(&mut cursor),
+            Err(SclsError::TruncatedRecord),
+        ));
     }
 }
